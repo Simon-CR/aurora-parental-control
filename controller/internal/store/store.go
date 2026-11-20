@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -47,6 +48,14 @@ type Event struct {
 	TS     string `json:"ts"`
 	Kind   string `json:"kind"`
 	Detail string `json:"detail"`
+}
+
+// LauncherGameState tracks per-title favorite and play-recency metadata for the Shelf launcher.
+type LauncherGameState struct {
+	TitleID      string `json:"title_id"`
+	Favorite     bool   `json:"favorite"`
+	LastPlayedAt int64  `json:"last_played_at"`
+	PlayCount    int    `json:"play_count"`
 }
 
 // Store wraps SQLite WAL persistence for xbox-guard.
@@ -126,6 +135,13 @@ CREATE TABLE IF NOT EXISTS events (
 	ts TEXT NOT NULL,
 	kind TEXT NOT NULL,
 	detail TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS launcher_game_state (
+	title_id TEXT PRIMARY KEY,
+	favorite INTEGER NOT NULL DEFAULT 0,
+	last_played_at INTEGER NOT NULL DEFAULT 0,
+	play_count INTEGER NOT NULL DEFAULT 0
 );
 `
 	if _, err := s.db.Exec(schema); err != nil {
@@ -332,6 +348,90 @@ func (s *Store) ListEvents(limit int) ([]Event, error) {
 		events = append(events, e)
 	}
 	return events, rows.Err()
+}
+
+// NormalizeTitleID validates and uppercases an 8-character Xbox 360 hex Title ID.
+func NormalizeTitleID(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) != 8 {
+		return "", false
+	}
+	for i := 0; i < 8; i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return "", false
+		}
+	}
+	return strings.ToUpper(s), true
+}
+
+// ListLauncherGameStates returns persisted favorite and recency records ordered by Title ID.
+func (s *Store) ListLauncherGameStates() ([]LauncherGameState, error) {
+	rows, err := s.db.Query(`
+SELECT title_id, favorite, last_played_at, play_count
+FROM launcher_game_state
+ORDER BY title_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query launcher_game_state: %w", err)
+	}
+	defer rows.Close()
+
+	states := make([]LauncherGameState, 0)
+	for rows.Next() {
+		var st LauncherGameState
+		var fav int
+		if err := rows.Scan(&st.TitleID, &fav, &st.LastPlayedAt, &st.PlayCount); err != nil {
+			return nil, fmt.Errorf("scan launcher_game_state: %w", err)
+		}
+		st.Favorite = fav != 0
+		states = append(states, st)
+	}
+	return states, rows.Err()
+}
+
+// SetLauncherFavorite upserts favorite status for a Title ID without resetting play history.
+func (s *Store) SetLauncherFavorite(titleID string, fav bool) error {
+	tid, ok := NormalizeTitleID(titleID)
+	if !ok {
+		return fmt.Errorf("invalid title_id %q", titleID)
+	}
+	_, err := s.db.Exec(`
+INSERT INTO launcher_game_state (title_id, favorite, last_played_at, play_count)
+VALUES (?, ?, 0, 0)
+ON CONFLICT(title_id) DO UPDATE SET
+	favorite = excluded.favorite`,
+		tid, boolToInt(fav),
+	)
+	if err != nil {
+		return fmt.Errorf("set launcher favorite %s: %w", tid, err)
+	}
+	return nil
+}
+
+// RecordLauncherPlayed records a game launch timestamp and increments play_count.
+func (s *Store) RecordLauncherPlayed(titleID string, ts int64) error {
+	tid, ok := NormalizeTitleID(titleID)
+	if !ok {
+		return fmt.Errorf("invalid title_id %q", titleID)
+	}
+	if ts <= 0 {
+		ts = time.Now().UTC().Unix()
+	}
+	_, err := s.db.Exec(`
+INSERT INTO launcher_game_state (title_id, favorite, last_played_at, play_count)
+VALUES (?, 0, ?, 1)
+ON CONFLICT(title_id) DO UPDATE SET
+	last_played_at = CASE
+		WHEN excluded.last_played_at > launcher_game_state.last_played_at THEN excluded.last_played_at
+		ELSE launcher_game_state.last_played_at
+	END,
+	play_count = launcher_game_state.play_count + 1`,
+		tid, ts,
+	)
+	if err != nil {
+		return fmt.Errorf("record launcher played %s: %w", tid, err)
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {
