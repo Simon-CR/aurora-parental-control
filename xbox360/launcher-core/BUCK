@@ -1,0 +1,8 @@
+rust_library(
+    name = "launcher_core",
+    srcs = glob(["src/**/*.rs"]),
+    crate = "launcher_core",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["PUBLIC"],
+)
