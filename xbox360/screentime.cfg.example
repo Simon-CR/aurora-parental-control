@@ -1,0 +1,22 @@
+# Aurora Parental Control — Xbox 360 Plugin Configuration
+# Copy this file to one of:
+#   Hdd1:\PeerPressure\SideLoading\screentime.cfg
+#   Hdd1:\screentime.cfg
+#   Usb0:\screentime.cfg
+
+# IPv4 address and HTTP port of your xbox-guard daemon
+server_ip=192.168.1.50
+server_port=8420
+
+# How often the plugin polls xbox-guard while playing (seconds, 2..60)
+poll_interval_sec=5
+
+# Grace period before locking gameplay if xbox-guard is unreachable (seconds, 10..600)
+offline_grace_sec=30
+
+# 4-button offline parent bypass PIN (shown when the controller is offline)
+# Comma-separated or compact 4-token code using:
+#   U = D-Pad Up, D = D-Pad Down, L = D-Pad Left, R = D-Pad Right
+#   X = X Button, Y = Y Button, LB = Left Bumper, RB = Right Bumper
+#   LT = Left Trigger, RT = Right Trigger
+parent_pin=U,D,L,R

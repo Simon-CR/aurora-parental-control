@@ -1,0 +1,134 @@
+blueprint:
+  name: Xbox 360 Screen Time Approval Notification
+  description: >
+    Sends an actionable mobile notification when a child asks for more time or
+    requests to resume on the Xbox 360 via Aurora Parental Control (xbox-guard).
+  domain: automation
+  input:
+    pending_request_sensor:
+      name: Pending Request Sensor
+      description: The sensor.<device>_pending_request entity published by xbox-guard.
+      selector:
+        entity:
+          domain: sensor
+    approve_button:
+      name: Approve Button
+      description: The button.<device>_approve entity from xbox-guard.
+      selector:
+        entity:
+          domain: button
+    add_15m_button:
+      name: Add 15 Minutes Button
+      description: The button.<device>_add_15m entity from xbox-guard.
+      selector:
+        entity:
+          domain: button
+    add_30m_button:
+      name: Add 30 Minutes Button
+      description: The button.<device>_add_30m entity from xbox-guard.
+      selector:
+        entity:
+          domain: button
+    deny_button:
+      name: Deny Button
+      description: The button.<device>_deny entity from xbox-guard.
+      selector:
+        entity:
+          domain: button
+    notify_service:
+      name: Mobile Notify Service
+      description: Notification service target, e.g. notify.mobile_app_phone.
+      default: notify.mobile_app_phone
+      selector:
+        text:
+
+mode: restart
+
+trigger:
+  - platform: state
+    entity_id: !input pending_request_sensor
+    from: "none"
+    not_to:
+      - "none"
+      - "unknown"
+      - "unavailable"
+
+variables:
+  req_type: "{{ states(pending_request_sensor) }}"
+
+action:
+  - service: !input notify_service
+    data:
+      title: "Xbox 360 Screen Time Request"
+      message: >
+        {% if req_type == 'resume' %}
+          The console is asking to resume play.
+        {% else %}
+          The console is asking for {{ req_type }} extra screen time.
+        {% endif %}
+      data:
+        tag: xbox_guard_request
+        actions:
+          - action: XBOX_APPROVE
+            title: "Approve Request"
+          - action: XBOX_ADD_15
+            title: "Approve +15m"
+          - action: XBOX_ADD_30
+            title: "Approve +30m"
+          - action: XBOX_DENY
+            title: "Deny"
+
+  - wait_for_trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: XBOX_APPROVE
+        id: approve
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: XBOX_ADD_15
+        id: add_15
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: XBOX_ADD_30
+        id: add_30
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: XBOX_DENY
+        id: deny
+    timeout:
+      minutes: 15
+    continue_on_timeout: false
+
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: approve
+        sequence:
+          - service: button.press
+            target:
+              entity_id: !input approve_button
+      - conditions:
+          - condition: trigger
+            id: add_15
+        sequence:
+          - service: button.press
+            target:
+              entity_id: !input add_15m_button
+      - conditions:
+          - condition: trigger
+            id: add_30
+        sequence:
+          - service: button.press
+            target:
+              entity_id: !input add_30m_button
+      - conditions:
+          - condition: trigger
+            id: deny
+        sequence:
+          - service: button.press
+            target:
+              entity_id: !input deny_button

@@ -1,0 +1,22 @@
+# Build outputs & tool caches
+xbox360/.tools/
+xbox360/buck-out/
+xbox360/target/
+*.xex
+*.elf
+*.pdb
+*.exe
+*.bin
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.cache/
+.art_cache/
+dist/
+build/
+screentime.cfg
+!screentime.cfg.example

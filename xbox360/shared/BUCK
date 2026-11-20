@@ -1,0 +1,13 @@
+rust_library(
+    name = "shared",
+    srcs = glob(["src/**/*.rs"]),
+    crate = "screentime_shared",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    target_compatible_with = ["xbox360//platforms:target[xbox]"],
+    visibility = ["PUBLIC"],
+    deps = [
+        "//third-party/rust:xbox360",
+        "//third-party/rust:xbox360-sys",
+    ],
+)
