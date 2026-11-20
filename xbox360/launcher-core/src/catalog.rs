@@ -92,6 +92,7 @@ pub enum SidebarTab {
     AllGames,
     RecentlyPlayed,
     Favorites,
+    LocalMultiplayer,
     Genre(Genre),
     Uncategorized,
     OpenAurora,
@@ -103,6 +104,7 @@ impl SidebarTab {
             SidebarTab::AllGames,
             SidebarTab::RecentlyPlayed,
             SidebarTab::Favorites,
+            SidebarTab::LocalMultiplayer,
         ];
         for g in Genre::ALL {
             out.push(SidebarTab::Genre(g));
@@ -117,6 +119,7 @@ impl SidebarTab {
             Self::AllGames => "All Games",
             Self::RecentlyPlayed => "Recently Played",
             Self::Favorites => "Favorites",
+            Self::LocalMultiplayer => "Local Multiplayer",
             Self::Genre(g) => g.label(),
             Self::Uncategorized => "Uncategorized",
             Self::OpenAurora => "Open Aurora",
@@ -257,6 +260,7 @@ pub struct GameEntry {
     pub has_poster: bool,
     pub has_backdrop: bool,
     pub description: String,
+    pub local_players: u8,
     pub favorite: bool,
     pub last_played_at: u64,
     pub play_count: u32,
@@ -265,6 +269,18 @@ pub struct GameEntry {
 impl GameEntry {
     pub const fn badge(&self) -> ContentBadge {
         ContentBadge::from_group(self.content_group)
+    }
+
+    pub const fn is_local_multiplayer(&self) -> bool {
+        self.local_players >= 2
+    }
+
+    pub fn local_players_badge(&self) -> Option<String> {
+        if self.local_players >= 2 {
+            Some(format!("{}P Local", self.local_players))
+        } else {
+            None
+        }
     }
 
     pub fn genres(&self) -> Vec<Genre> {
@@ -276,6 +292,7 @@ impl GameEntry {
             SidebarTab::AllGames => true,
             SidebarTab::RecentlyPlayed => self.last_played_at > 0,
             SidebarTab::Favorites => self.favorite,
+            SidebarTab::LocalMultiplayer => self.is_local_multiplayer(),
             SidebarTab::Genre(g) => (self.genre_flag & g.mask()) != 0,
             SidebarTab::Uncategorized => self.genre_flag == 0,
             SidebarTab::OpenAurora => true,
@@ -327,9 +344,9 @@ impl Catalog {
         let mut entries = Vec::new();
         for (line_no, line) in lines.enumerate() {
             let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() != 15 {
+            if cols.len() != 15 && cols.len() != 16 {
                 return Err(format!(
-                    "catalog line {}: expected 15 columns, got {}",
+                    "catalog line {}: expected 15 or 16 columns, got {}",
                     line_no + 2,
                     cols.len()
                 ));
@@ -337,6 +354,10 @@ impl Catalog {
             let tid = normalize_hex_id(cols[1])
                 .ok_or_else(|| format!("catalog line {}: invalid title_id {:?}", line_no + 2, cols[1]))?;
             let media_id = normalize_hex_id(cols[2]).unwrap_or_else(|| String::from("00000000"));
+            let local_players = cols
+                .get(15)
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(0);
             entries.push(GameEntry {
                 id: cols[0].trim().parse::<u32>().unwrap_or(0),
                 title_id: tid,
@@ -353,6 +374,7 @@ impl Catalog {
                 has_poster: cols[12].trim() == "1",
                 has_backdrop: cols[13].trim() == "1",
                 description: cols[14].to_string(),
+                local_players,
                 favorite: false,
                 last_played_at: 0,
                 play_count: 0,
@@ -469,10 +491,17 @@ impl Catalog {
     }
 
     pub fn tab_count(&self, tab: SidebarTab) -> usize {
+        self.tab_count_with_mp(tab, false)
+    }
+
+    pub fn tab_count_with_mp(&self, tab: SidebarTab, local_mp_only: bool) -> usize {
         if !tab.is_filter_tab() {
             return 0;
         }
-        self.entries.iter().filter(|e| e.matches_tab(tab)).count()
+        self.entries
+            .iter()
+            .filter(|e| e.matches_tab(tab) && (!local_mp_only || e.is_local_multiplayer()))
+            .count()
     }
 
     pub fn filtered_indices(
@@ -481,11 +510,25 @@ impl Catalog {
         sort: SortMode,
         letter: LetterFilter,
     ) -> Vec<usize> {
+        self.filtered_indices_with_mp(tab, sort, letter, false)
+    }
+
+    pub fn filtered_indices_with_mp(
+        &self,
+        tab: SidebarTab,
+        sort: SortMode,
+        letter: LetterFilter,
+        local_mp_only: bool,
+    ) -> Vec<usize> {
         let mut indices: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.matches_tab(tab) && letter.matches_title(&e.title_name))
+            .filter(|(_, e)| {
+                e.matches_tab(tab)
+                    && (!local_mp_only || e.is_local_multiplayer())
+                    && letter.matches_title(&e.title_name)
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -608,5 +651,39 @@ mod tests {
         assert_eq!(f.next().next(), LetterFilter::Letter('A'));
         assert_eq!(LetterFilter::Letter('Z').next(), LetterFilter::All);
         assert_eq!(f.prev(), LetterFilter::Letter('Z'));
+    }
+
+    #[test]
+    fn parses_16_col_local_multiplayer_and_stacks_with_genre() {
+        let raw = [
+            "SHELF_CATALOG\tv1\t1700000100\t3",
+            "12\t45410912\t0E7A7EB3\tPortal 2\t2\t1\t1\tUsb0:\t\\games\\portal 2\tdefault.xex\tEA\t2012\t1\t1\tCo-op\t2",
+            "13\t454108E6\t5C087C2C\tSkate 3\t1024\t1\t3\tUsb0:\t\\games\\skate 3\t5c087c2c\tEA\t2014\t1\t0\tSkate\t0",
+            "102\t584108B7\t11223344\tCastle Crashers\t6\t2\t3\tUsb0:\t\\content\\cc\tf943\tBehemoth\t2008\t1\t0\tBrawler\t4",
+        ]
+        .join("\n");
+
+        let cat = Catalog::parse_tsv(&raw).expect("16-col tsv");
+        assert_eq!(cat.tab_count(SidebarTab::LocalMultiplayer), 2);
+        assert_eq!(cat.tab_count_with_mp(SidebarTab::Genre(Genre::SportsRecreation), true), 0);
+        assert_eq!(cat.tab_count_with_mp(SidebarTab::Genre(Genre::ActionAdventure), true), 2);
+        assert_eq!(cat.tab_count_with_mp(SidebarTab::Genre(Genre::Family), true), 1);
+
+        let local_only = cat.filtered_indices(
+            SidebarTab::LocalMultiplayer,
+            SortMode::TitleAsc,
+            LetterFilter::All,
+        );
+        assert_eq!(local_only.len(), 2);
+        assert_eq!(cat.get(local_only[0]).unwrap().local_players_badge(), Some(String::from("4P Local")));
+        assert_eq!(cat.get(local_only[1]).unwrap().local_players_badge(), Some(String::from("2P Local")));
+
+        let sports_local = cat.filtered_indices_with_mp(
+            SidebarTab::Genre(Genre::SportsRecreation),
+            SortMode::TitleAsc,
+            LetterFilter::All,
+            true,
+        );
+        assert!(sports_local.is_empty());
     }
 }

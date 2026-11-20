@@ -236,11 +236,16 @@ func validateCatalogTSV(data []byte) (int, string, error) {
 		}
 
 		fields := strings.Split(line, "\t")
-		if len(fields) != 15 {
-			return 0, "", fmt.Errorf("line %d: expected 15 TSV columns, got %d", idx+1, len(fields))
+		if len(fields) != 15 && len(fields) != 16 {
+			return 0, "", fmt.Errorf("line %d: expected 15 or 16 TSV columns, got %d", idx+1, len(fields))
 		}
 		if _, ok := ValidateTitleID(fields[1]); !ok {
 			return 0, "", fmt.Errorf("line %d: invalid title_id %q", idx+1, fields[1])
+		}
+		if len(fields) == 16 && strings.TrimSpace(fields[15]) != "" {
+			if _, err := parsePositiveInt64(strings.TrimSpace(fields[15])); err != nil {
+				return 0, "", fmt.Errorf("line %d: invalid local_players %q", idx+1, fields[15])
+			}
 		}
 		games++
 	}

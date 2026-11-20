@@ -60,6 +60,11 @@ pub fn draw_launcher_ui(
                     theme::CARD,
                     theme::DRIFTWOOD_MUTED,
                 );
+                if nav.local_mp_only {
+                    draw_chip(ui, "Back: Local MP ON", theme::SAGE_BG, theme::SAGE_FG);
+                } else {
+                    draw_chip(ui, "Back: Local MP", theme::CARD, theme::DRIFTWOOD_MUTED);
+                }
                 if let Some(msg) = notice {
                     draw_chip(ui, msg, theme::AMBER_BG, theme::AMBER_FG);
                 }
@@ -172,7 +177,8 @@ fn draw_sidebar(ui: &mut egui::Ui, catalog: &Catalog, nav: &NavState) {
                 let is_hovered = idx == nav.sidebar_idx;
                 let is_active = idx == nav.active_filter_tab_idx;
                 let is_focused = nav.zone == FocusZone::Sidebar && is_hovered;
-                let count = catalog.tab_count(*tab);
+                let count = catalog
+                    .tab_count_with_mp(*tab, nav.local_mp_only && *tab != SidebarTab::LocalMultiplayer);
                 let resp = draw_sidebar_row(
                     ui,
                     tab.label(),
@@ -433,6 +439,9 @@ fn draw_hero_strip(
                     theme::CARD,
                     theme::TERRACOTTA_FOCUS,
                 );
+                if let Some(mp_badge) = entry.local_players_badge() {
+                    draw_chip(ui, &mp_badge, theme::SAGE_BG, theme::SAGE_FG);
+                }
                 if entry.favorite {
                     draw_chip(ui, "Favorite", theme::AMBER_BG, theme::AMBER_FG);
                 }

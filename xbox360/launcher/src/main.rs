@@ -253,10 +253,11 @@ fn run_app() {
                 notice = None;
             }
 
-            let mut filtered = catalog.filtered_indices(
+            let mut filtered = catalog.filtered_indices_with_mp(
                 nav.active_filter_tab(),
                 nav.sort_mode,
                 nav.letter_filter,
+                nav.local_mp_only,
             );
             nav.clamp_grid(filtered.len());
 
@@ -276,10 +277,11 @@ fn run_app() {
                     NavEvent::ToggleFavorite { title_id, favorite } => {
                         persist_userstate(&cfg.cache_dir, &catalog);
                         worker.send(WorkerCmd::SetFavorite { title_id, favorite });
-                        filtered = catalog.filtered_indices(
+                        filtered = catalog.filtered_indices_with_mp(
                             nav.active_filter_tab(),
                             nav.sort_mode,
                             nav.letter_filter,
+                            nav.local_mp_only,
                         );
                         nav.clamp_grid(filtered.len());
                     }

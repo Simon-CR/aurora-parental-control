@@ -167,6 +167,7 @@ mod tests {
             has_poster: true,
             has_backdrop: true,
             description: String::new(),
+            local_players: 0,
             favorite: false,
             last_played_at: 0,
             play_count: 0,

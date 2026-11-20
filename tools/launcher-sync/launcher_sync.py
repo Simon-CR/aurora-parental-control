@@ -40,6 +40,19 @@ USER_AGENT = "Aurora/0.7b"
 POSTER_SIZE = (180, 248)
 BACKDROP_SIZE = (640, 360)
 YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+LOCAL_MP_DESC_RE = re.compile(
+    r"(?:"
+    r"local\s+multiplayer(?:\s+(\d+)\s*-\s*(\d+)|\s+(\d+))?"
+    r"|local\s+co-?op(?:\s+(\d+)\s*-\s*(\d+)|\s+(\d+))?"
+    r"|offline\s+(?:multiplayer|co-?op|versus|players?)(?:\s+(\d+)\s*-\s*(\d+)|\s+(\d+))?"
+    r"|split[- ]?screen(?:\s+(\d+)\s*-\s*(\d+))?"
+    r"|same\s+(?:console|screen|xbox)"
+    r"|\b([2-9]|1[0-6])\s+players?\s+(?:local|offline|split[- ]?screen|co-?op|on\s+one)"
+    r"|\b([2-9]|1[0-6])\s+player\s+co-?op"
+    r"|multiplayer\s+local"
+    r")",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,7 @@ class CatalogRow:
     publisher: str
     release_year: str
     description: str
+    local_players: int = 0
 
 
 class PersistentFTP:
@@ -199,6 +213,26 @@ def extract_release_year(raw: object) -> str:
     return m.group(1) if m else ""
 
 
+def detect_local_players(game_caps_offline: object, description: object) -> int:
+    """Return max local player count (>=2 for local multiplayer, 1 single-player, 0 unknown)."""
+    caps = int(game_caps_offline or 0) & 0xFFFFFFFFFFFFFFFF
+    off_max = (caps >> 8) & 0xFF
+    coop_max = (caps >> 24) & 0xFF
+    cap_max = max(off_max, coop_max)
+    if cap_max >= 2:
+        return min(cap_max, 16)
+    if off_max == 1 and coop_max == 0:
+        return 1
+
+    text = str(description or "")
+    m = LOCAL_MP_DESC_RE.search(text)
+    if not m:
+        return 0
+    nums = [int(g) for g in m.groups() if g and g.isdigit()]
+    inferred = max(nums) if nums else 2
+    return max(2, min(inferred, 16))
+
+
 def normalize_mount_point(raw: object, device_name: object = None) -> str:
     mp = str(raw or "").strip()
     if mp:
@@ -261,7 +295,7 @@ def load_catalog_rows(content_db_bytes: bytes, settings_db_bytes: bytes | None) 
 
             query = (
                 "SELECT Id, TitleId, MediaId, TitleName, GenreFlag, ContentGroup, FileType, "
-                "Directory, Executable, Publisher, ReleaseDate, Description, ScanPathId "
+                "Directory, Executable, Publisher, ReleaseDate, Description, ScanPathId, GameCapsOffline "
                 "FROM ContentItems "
                 "WHERE TitleId IS NOT NULL AND TitleId != 0 "
                 "ORDER BY LOWER(COALESCE(TitleName, '')), Id"
@@ -282,6 +316,7 @@ def load_catalog_rows(content_db_bytes: bytes, settings_db_bytes: bytes | None) 
                     release_date,
                     description,
                     scan_path_id,
+                    game_caps_offline,
                 ) = r
                 tid_hex = format_u32_hex(title_id)
                 if tid_hex == "00000000":
@@ -289,6 +324,7 @@ def load_catalog_rows(content_db_bytes: bytes, settings_db_bytes: bytes | None) 
                 sp_path, dev_id = scan_paths.get(int(scan_path_id or 0), ("\\", ""))
                 device = devices.get(dev_id) or "Usb0:"
                 resolved_dir = merge_scan_directory(sp_path, str(directory or ""))
+                local_players = detect_local_players(game_caps_offline, description)
                 rows.append(
                     CatalogRow(
                         item_id=int(item_id),
@@ -304,6 +340,7 @@ def load_catalog_rows(content_db_bytes: bytes, settings_db_bytes: bytes | None) 
                         publisher=clean_tsv_text(publisher),
                         release_year=extract_release_year(release_date),
                         description=clean_tsv_text(description, max_len=240),
+                        local_players=local_players,
                     )
                 )
             return rows
@@ -341,6 +378,7 @@ def render_catalog_tsv(
             has_poster,
             has_backdrop,
             row.description,
+            str(row.local_players),
         ]
         lines.append("\t".join(cols))
     return "\n".join(lines) + "\n"
