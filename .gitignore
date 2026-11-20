@@ -6,6 +6,7 @@ xbox360/target/
 *.elf
 *.pdb
 *.exe
+*.dll
 *.bin
 *.db
 *.db-wal
@@ -16,6 +17,7 @@ __pycache__/
 *.pyc
 .cache/
 .art_cache/
+launcher-cache/
 dist/
 build/
 screentime.cfg

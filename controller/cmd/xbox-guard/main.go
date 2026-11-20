@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Simon-CR/aurora-parental-control/controller/internal/catalog"
 	"github.com/Simon-CR/aurora-parental-control/controller/internal/httpapi"
 	"github.com/Simon-CR/aurora-parental-control/controller/internal/mqtt"
 	"github.com/Simon-CR/aurora-parental-control/controller/internal/policy"
@@ -25,15 +26,16 @@ func envOr(key, fallback string) string {
 
 func main() {
 	var (
-		listenAddr = flag.String("listen", envOr("XBOX_GUARD_LISTEN", ":8420"), "HTTP listen address")
-		dbPath     = flag.String("db", envOr("XBOX_GUARD_DB", "./xbox-guard.db"), "SQLite WAL database path")
-		tzName     = flag.String("tz", envOr("XBOX_GUARD_TZ", "America/Toronto"), "IANA timezone name")
-		mqttBroker = flag.String("mqtt-broker", envOr("XBOX_GUARD_MQTT_BROKER", ""), "MQTT broker URL (optional)")
-		mqttUser   = flag.String("mqtt-user", envOr("XBOX_GUARD_MQTT_USER", ""), "MQTT username")
-		mqttPass   = flag.String("mqtt-pass", envOr("XBOX_GUARD_MQTT_PASS", ""), "MQTT password")
-		mqttPrefix = flag.String("mqtt-prefix", envOr("XBOX_GUARD_MQTT_PREFIX", "xbox_guard"), "MQTT base topic prefix")
-		deviceID   = flag.String("device-id", envOr("XBOX_GUARD_DEVICE_ID", "xbox360_living_room"), "Home Assistant device ID")
-		deviceName = flag.String("device-name", envOr("XBOX_GUARD_DEVICE_NAME", "Xbox 360"), "Home Assistant device name")
+		listenAddr  = flag.String("listen", envOr("XBOX_GUARD_LISTEN", ":8420"), "HTTP listen address")
+		dbPath      = flag.String("db", envOr("XBOX_GUARD_DB", "./xbox-guard.db"), "SQLite WAL database path")
+		launcherDir = flag.String("launcher-dir", envOr("XBOX_GUARD_LAUNCHER_DIR", "./launcher-cache"), "Shelf launcher catalog and JPEG cache directory")
+		tzName      = flag.String("tz", envOr("XBOX_GUARD_TZ", "America/Toronto"), "IANA timezone name")
+		mqttBroker  = flag.String("mqtt-broker", envOr("XBOX_GUARD_MQTT_BROKER", ""), "MQTT broker URL (optional)")
+		mqttUser    = flag.String("mqtt-user", envOr("XBOX_GUARD_MQTT_USER", ""), "MQTT username")
+		mqttPass    = flag.String("mqtt-pass", envOr("XBOX_GUARD_MQTT_PASS", ""), "MQTT password")
+		mqttPrefix  = flag.String("mqtt-prefix", envOr("XBOX_GUARD_MQTT_PREFIX", "xbox_guard"), "MQTT base topic prefix")
+		deviceID    = flag.String("device-id", envOr("XBOX_GUARD_DEVICE_ID", "xbox360_living_room"), "Home Assistant device ID")
+		deviceName  = flag.String("device-name", envOr("XBOX_GUARD_DEVICE_NAME", "Xbox 360"), "Home Assistant device name")
 	)
 	flag.Parse()
 
@@ -47,6 +49,11 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer st.Close()
+
+	cat, err := catalog.Open(*launcherDir)
+	if err != nil {
+		log.Fatalf("open launcher catalog dir: %v", err)
+	}
 
 	eng := policy.New(st, loc, time.Now)
 
@@ -83,7 +90,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *listenAddr,
-		Handler:           httpapi.NewMux(eng),
+		Handler:           httpapi.NewMuxWithCatalog(eng, cat, st),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
