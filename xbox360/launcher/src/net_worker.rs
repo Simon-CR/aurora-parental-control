@@ -1,8 +1,6 @@
 //! Background worker thread for Hdd1 cache reads, xbox-guard LAN HTTP sync, and JPEG decoding.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -11,11 +9,13 @@ use std::time::{Duration, Instant};
 use launcher_core::catalog::Catalog;
 use launcher_core::guard::{
     GuardStatus, LauncherConfig, backdrop_path, catalog_path, favorite_path, format_get,
-    format_post, heartbeat_path, parse_heartbeat_body, parse_http_response, played_path,
-    poster_path, request_resume_path, request_time_path, userstate_path,
+    format_post, heartbeat_path, parse_heartbeat_body, played_path, poster_path,
+    request_resume_path, request_time_path, userstate_path,
 };
 
 use crate::assets::DecodedRgba;
+use crate::diag;
+use crate::xnet;
 
 const LAUNCHER_TITLE_ID_HEX: &str = "58584C43";
 const MAX_TSV_BYTES: usize = 4 * 1024 * 1024;
@@ -84,40 +84,19 @@ fn ensure_cache_dirs(cache_dir: &str) {
     let _ = fs::create_dir_all(base.join("backdrops"));
 }
 
-fn endpoint(cfg: &LauncherConfig) -> Option<(SocketAddr, String)> {
+fn endpoint(cfg: &LauncherConfig) -> Option<([u8; 4], u16, String)> {
     let ip = cfg.server_ip?;
     let host_hdr = cfg.server_host_header()?;
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), cfg.server_port));
-    Some((addr, host_hdr))
+    Some((ip, cfg.server_port, host_hdr))
 }
 
 fn http_exchange(
-    addr: SocketAddr,
+    ip: [u8; 4],
+    port: u16,
     req: &[u8],
     max_body_bytes: usize,
 ) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1200))
-        .map_err(|e| format!("connect: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    stream.write_all(req).map_err(|e| format!("write: {e}"))?;
-
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if raw.len() + n > max_body_bytes + 4096 {
-                    return Err(String::from("HTTP response too large"));
-                }
-                raw.extend_from_slice(&chunk[..n]);
-            }
-            Err(e) => return Err(format!("read: {e}")),
-        }
-    }
-    let (code, body) = parse_http_response(&raw)?;
-    Ok((code, body.to_vec()))
+    xnet::http_exchange(ip, port, req, max_body_bytes, 1500)
 }
 
 fn decode_image_bytes(raw: &[u8]) -> Option<DecodedRgba> {
@@ -141,7 +120,7 @@ fn load_or_fetch_art(
     title_id: &str,
     remote_path: String,
     fetch_remote: bool,
-    ep: Option<&(SocketAddr, String)>,
+    ep: Option<&([u8; 4], u16, String)>,
 ) -> Option<DecodedRgba> {
     let disk_path = Path::new(cache_dir).join(subdir).join(format!("{title_id}.jpg"));
     if let Ok(bytes) = fs::read(&disk_path)
@@ -153,9 +132,9 @@ fn load_or_fetch_art(
     if !fetch_remote {
         return None;
     }
-    let (addr, host_hdr) = ep?;
+    let (ip, port, host_hdr) = ep?;
     let req = format_get(&remote_path, host_hdr);
-    let (code, body) = http_exchange(*addr, &req, MAX_JPEG_BYTES).ok()?;
+    let (code, body) = http_exchange(*ip, *port, &req, MAX_JPEG_BYTES).ok()?;
     if code != 200 || body.is_empty() {
         return None;
     }
@@ -164,9 +143,9 @@ fn load_or_fetch_art(
     Some(decoded)
 }
 
-fn poll_heartbeat(ep: &(SocketAddr, String)) -> GuardStatus {
-    let req = format_get(&heartbeat_path(LAUNCHER_TITLE_ID_HEX), &ep.1);
-    match http_exchange(ep.0, &req, 64 * 1024) {
+fn poll_heartbeat(ep: &([u8; 4], u16, String)) -> GuardStatus {
+    let req = format_get(&heartbeat_path(LAUNCHER_TITLE_ID_HEX), &ep.2);
+    match http_exchange(ep.0, ep.1, &req, 64 * 1024) {
         Ok((200, body)) => match std::str::from_utf8(&body) {
             Ok(text) => parse_heartbeat_body(text).unwrap_or_default(),
             Err(_) => GuardStatus::default(),
@@ -175,23 +154,32 @@ fn poll_heartbeat(ep: &(SocketAddr, String)) -> GuardStatus {
     }
 }
 
-fn sync_startup_from_server(cfg: &LauncherConfig, ep: &(SocketAddr, String), msg_tx: &Sender<WorkerMsg>) {
-    let _ = msg_tx.send(WorkerMsg::GuardUpdated(poll_heartbeat(ep)));
+fn sync_startup_from_server(
+    cfg: &LauncherConfig,
+    ep: &([u8; 4], u16, String),
+    msg_tx: &Sender<WorkerMsg>,
+) {
+    let st = poll_heartbeat(ep);
+    let hb_online = st.online;
+    let _ = msg_tx.send(WorkerMsg::GuardUpdated(st));
 
-    let cat_req = format_get(catalog_path(), &ep.1);
-    if let Ok((200, body)) = http_exchange(ep.0, &cat_req, MAX_TSV_BYTES)
+    let cat_req = format_get(catalog_path(), &ep.2);
+    let mut cat_detail = String::from("err");
+    if let Ok((200, body)) = http_exchange(ep.0, ep.1, &cat_req, MAX_TSV_BYTES)
         && let Ok(text) = std::str::from_utf8(&body)
         && let Ok(parsed) = Catalog::parse_tsv(text)
     {
+        cat_detail = format!("games={}", parsed.entries().len());
         if !parsed.is_empty() {
             let local_cat = Path::new(&cfg.cache_dir).join("catalog.tsv");
             let _ = fs::write(local_cat, text.as_bytes());
             let _ = msg_tx.send(WorkerMsg::CatalogLoaded { catalog: parsed });
         }
     }
+    diag::stage("worker_sync", &format!("hb_online={hb_online} {cat_detail}"));
 
-    let us_req = format_get(userstate_path(), &ep.1);
-    if let Ok((200, body)) = http_exchange(ep.0, &us_req, MAX_TSV_BYTES)
+    let us_req = format_get(userstate_path(), &ep.2);
+    if let Ok((200, body)) = http_exchange(ep.0, ep.1, &us_req, MAX_TSV_BYTES)
         && let Ok(text) = std::str::from_utf8(&body)
     {
         let local_us = Path::new(&cfg.cache_dir).join("userstate.tsv");
@@ -261,21 +249,21 @@ fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<
                         });
                     }
                     WorkerCmd::SetFavorite { title_id, favorite } => {
-                        if let Some((addr, host_hdr)) = ep.as_ref() {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
                             let req = format_post(&favorite_path(&title_id, favorite), host_hdr);
-                            let _ = http_exchange(*addr, &req, 4096);
+                            let _ = http_exchange(*ip, *port, &req, 4096);
                         }
                     }
                     WorkerCmd::RecordPlayed { title_id } => {
-                        if let Some((addr, host_hdr)) = ep.as_ref() {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
                             let req = format_post(&played_path(&title_id), host_hdr);
-                            let _ = http_exchange(*addr, &req, 4096);
+                            let _ = http_exchange(*ip, *port, &req, 4096);
                         }
                     }
                     WorkerCmd::RequestMoreTime { minutes } => {
-                        if let Some((addr, host_hdr)) = ep.as_ref() {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
                             let req = format_post(&request_time_path(minutes), host_hdr);
-                            match http_exchange(*addr, &req, 4096) {
+                            match http_exchange(*ip, *port, &req, 4096) {
                                 Ok((200, _)) => {
                                     let _ = msg_tx.send(WorkerMsg::Notice(format!(
                                         "Sent +{minutes} min request to parent"
@@ -294,9 +282,9 @@ fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<
                         }
                     }
                     WorkerCmd::RequestResume => {
-                        if let Some((addr, host_hdr)) = ep.as_ref() {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
                             let req = format_post(request_resume_path(), host_hdr);
-                            match http_exchange(*addr, &req, 4096) {
+                            match http_exchange(*ip, *port, &req, 4096) {
                                 Ok((200, _)) => {
                                     let _ = msg_tx.send(WorkerMsg::Notice(String::from(
                                         "Sent resume request to parent",

@@ -3,10 +3,12 @@
 #![no_main]
 
 mod assets;
+mod diag;
 mod launch;
 mod net_worker;
 mod theme;
 mod ui;
+mod xnet;
 
 use std::fs;
 use std::path::Path;
@@ -23,8 +25,12 @@ use xbox360::xam::input;
 use xbox360_draw::draw::DrawList;
 use xbox360_egui::Painter;
 use xbox360_gpu::Gpu;
+use xbox360_sys::mmio::GpuRegisters;
 use xbox360_sys::xam::{Keystroke, KeystrokeFlags, PadKey};
-use xbox360_video::Display;
+use xbox360_sys::xboxkrnl::{
+    DisplayInformation, VdGetCurrentDisplayInformation, VdSetDisplayMode,
+};
+use xbox360_video::{Display, FrameSize, FrameView};
 
 use crate::assets::TextureManager;
 use crate::net_worker::{NetWorker, WorkerCmd, WorkerMsg};
@@ -50,31 +56,45 @@ enum PendingAction {
 xbox360::sys::bridged!(#[unsafe(no_mangle)] pub _start, main);
 
 extern "C" fn main(_context: u32) -> u32 {
+    diag::reset_log();
+    diag::stage("01_main_enter", "entered _start -> main");
     let join = std::thread::Builder::new()
         .stack_size(UI_STACK_BYTES)
         .spawn(run_app);
     match join {
         Ok(handle) => {
             if handle.join().is_err() {
-                println!("shelf_launcher: UI thread panicked");
+                diag::stage("01_main_join_panic", "UI thread panicked");
+            } else {
+                diag::stage("01_main_join_ok", "UI thread exited cleanly");
             }
         }
         Err(error) => {
-            println!("shelf_launcher: failed to spawn UI thread: {error}");
+            diag::stage("01_main_spawn_err", &format!("{error}"));
         }
     }
-    xbox360::title::terminate()
+    xbox360::title::return_to_dashboard()
 }
 
-fn load_config() -> LauncherConfig {
+fn load_config() -> (LauncherConfig, &'static str) {
     for path in CFG_SEARCH_PATHS {
         if let Ok(raw) = fs::read_to_string(path) {
             println!("shelf: loaded config from {path}");
-            return LauncherConfig::parse_cfg(&raw);
+            return (LauncherConfig::parse_cfg(&raw), path);
         }
     }
     println!("shelf: no screentime.cfg found; starting in offline cache mode");
-    LauncherConfig::default()
+    (LauncherConfig::default(), "default")
+}
+
+fn query_vd_info() -> (DisplayInformation, u32, u32) {
+    let mut info = DisplayInformation::new();
+    // SAFETY: `info` is an aligned 0x58-byte block owned by this stack frame.
+    unsafe { VdGetCurrentDisplayInformation(info.as_mut_ptr()) };
+    let regs = GpuRegisters::get();
+    let ctrl = regs.display_graphics_control().read();
+    let addr = regs.display_primary_surface().read();
+    (info, ctrl, addr)
 }
 
 fn load_cached_catalog(cache_dir: &str) -> Catalog {
@@ -185,8 +205,43 @@ fn process_keystroke(
 }
 
 fn run_app() {
-    let cfg = load_config();
+    diag::stage("02_ui_thread_start", "1MB stack running");
+    let (cfg, cfg_src) = load_config();
+    if let Some(ip) = cfg.server_ip {
+        let (link, xnet_rc, wsa_rc) = xnet::init_once();
+        diag::set_server(ip, cfg.server_port);
+        diag::stage(
+            "03_cfg_loaded",
+            &format!("src={cfg_src} cache={} port={}", cfg.cache_dir, cfg.server_port),
+        );
+        diag::stage(
+            "04_xnet_init",
+            &format!("link=0x{link:x} xnet={xnet_rc} wsa={wsa_rc}"),
+        );
+    } else {
+        diag::stage("03_cfg_loaded", &format!("offline src={cfg_src}"));
+    }
+
+    let (mut vd_info, ctrl, primary_addr) = query_vd_info();
+    diag::stage(
+        "05_vd_info",
+        &format!(
+            "surf={}x{} win={},{},{},{} scaled={}x{} cs={} ctrl=0x{ctrl:08x} addr=0x{primary_addr:08x}",
+            vd_info.surface_width,
+            vd_info.surface_height,
+            vd_info.left,
+            vd_info.top,
+            vd_info.right,
+            vd_info.bottom,
+            vd_info.scaled_width,
+            vd_info.scaled_height,
+            vd_info.colorspace,
+        ),
+    );
+
     let mut catalog = load_cached_catalog(&cfg.cache_dir);
+    diag::stage("06_catalog_loaded", &format!("games={}", catalog.entries().len()));
+
     let mut nav = NavState::default();
     let mut guard = GuardStatus::default();
     let mut pin_override = false;
@@ -194,29 +249,69 @@ fn run_app() {
     let mut notice: Option<(String, Instant)> = None;
 
     loop {
+        diag::stage("07_display_new_begin", "calling Display::new");
         let mut display = match Display::new() {
             Ok(d) => d,
             Err(error) => {
-                println!("shelf: Display::new failed: {error}");
-                return;
-            }
-        };
-        let mut gpu = match Gpu::new() {
-            Ok(g) => g,
-            Err(error) => {
-                println!("shelf: Gpu::new failed: {error}");
-                return;
+                diag::stage("07_display_new_err", &format!("{error}"));
+                if vd_info.surface_width == 0 || vd_info.surface_height == 0 {
+                    // SAFETY: re-initializes video mode if dashboard left surface unset.
+                    unsafe { VdSetDisplayMode(0) };
+                    let (next_vd, next_ctrl, next_addr) = query_vd_info();
+                    vd_info = next_vd;
+                    diag::stage(
+                        "07_display_retry_vdsetmode",
+                        &format!(
+                            "surf={}x{} ctrl=0x{next_ctrl:08x} addr=0x{next_addr:08x}",
+                            vd_info.surface_width, vd_info.surface_height
+                        ),
+                    );
+                    match Display::new() {
+                        Ok(d) => d,
+                        Err(err2) => {
+                            diag::stage("07_display_fatal", &format!("{err2}"));
+                            return;
+                        }
+                    }
+                } else {
+                    diag::stage("07_display_fatal", &format!("{error}"));
+                    return;
+                }
             }
         };
 
         let size = display.size();
+        diag::stage("07_display_new_ok", &format!("size={}x{}", size.width, size.height));
+
+        diag::stage("08a_cpu_splash1_begin", "terracotta 320x180 CPU scanout test");
+        let splash = vec![0x004B_7AC8u32; 320 * 180];
+        if let Some(frame) = FrameView::new(&splash, FrameSize { width: 320, height: 180 }, 320) {
+            display.present(frame);
+            diag::stage("08a_cpu_splash1_ok", "submit_flip #1 returned");
+            display.present(frame);
+            diag::stage("08b_cpu_splash2_ok", "wait_for_flip + submit_flip #2 returned");
+        }
+        drop(splash);
+
+        diag::stage("09_gpu_new_begin", "calling Gpu::new");
+        let mut gpu = match Gpu::new() {
+            Ok(g) => g,
+            Err(error) => {
+                diag::stage("09_gpu_new_err", &format!("{error}"));
+                return;
+            }
+        };
+        diag::stage("09_gpu_new_ok", "GPU arenas and shaders ready");
+
         let context = egui::Context::default();
         theme::apply_theme(&context);
         let mut painter = Painter::new();
         let mut list = DrawList::new();
         let mut textures = TextureManager::default();
         let worker = NetWorker::spawn(cfg.clone());
+        diag::stage("10_worker_spawned", "network/art worker thread started");
         let start = Instant::now();
+        let mut frame_num: u32 = 0;
 
         let pending_action = loop {
             while let Some(msg) = worker.try_recv() {
@@ -383,7 +478,18 @@ fn run_app() {
                     notice_text,
                 );
             });
+            let shapes_len = output.shapes.len();
+            let tex_set_len = output.textures_delta.set.len();
             let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+            if frame_num == 0 {
+                diag::stage(
+                    "11_frame1_egui_ok",
+                    &format!(
+                        "shapes={shapes_len} prims={} tex_set={tex_set_len}",
+                        primitives.len()
+                    ),
+                );
+            }
             list.clear();
             list.set_clear_color(Some(theme::CLEAR_BG));
             if let Err(error) = painter.paint(
@@ -393,13 +499,28 @@ fn run_app() {
                 &primitives,
                 PIXELS_PER_POINT,
             ) {
-                println!("shelf: painter error: {error}");
+                diag::stage("frame_paint_err", &format!("frame={frame_num} err={error}"));
                 break PendingAction::Exit;
+            }
+            if frame_num == 0 {
+                diag::stage(
+                    "12_frame1_paint_ok",
+                    &format!("tris={} cmds={}", list.triangles().len(), list.commands().len()),
+                );
+                diag::stage("13_frame1_render_begin", "calling gpu.render");
             }
             if let Err(error) = gpu.render(&mut display, &list) {
-                println!("shelf: gpu render error: {error}");
+                diag::stage("13_frame1_render_err", &format!("frame={frame_num} err={error}"));
                 break PendingAction::Exit;
             }
+            if frame_num == 0 {
+                diag::stage("13_frame1_render_ok", "first GPU frame submitted");
+            } else if frame_num == 1 {
+                diag::stage("14_frame2_render_ok", "GPU flip #1 latched cleanly");
+            } else if frame_num == 9 {
+                diag::stage("15_frame10_ok", "steady-state rendering active");
+            }
+            frame_num = frame_num.saturating_add(1);
         };
 
         match pending_action {
@@ -430,8 +551,9 @@ fn run_app() {
                 drop(display);
 
                 if let Err(err) = launch::execute_launch(&target) {
-                    println!("shelf: launch failed: {err}");
+                    diag::stage("launch_err", &err);
                     nav.set_launch_error(err);
+                    (vd_info, _, _) = query_vd_info();
                     continue;
                 }
                 return;

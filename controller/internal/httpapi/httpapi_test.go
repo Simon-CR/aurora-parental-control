@@ -232,3 +232,61 @@ func TestLauncherEndpoints(t *testing.T) {
 		t.Fatalf("unexpected userstate row: %q", lines[0])
 	}
 }
+
+func TestLauncherDiagEndpoints(t *testing.T) {
+	mux, _ := setupLauncherHandler(t)
+
+	recEmpty := httptest.NewRecorder()
+	mux.ServeHTTP(recEmpty, httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag/recent", nil))
+	if recEmpty.Code != http.StatusOK || strings.TrimSpace(recEmpty.Body.String()) != "[]" {
+		t.Fatalf("expected empty recent array, got code=%d body=%q", recEmpty.Code, recEmpty.Body.String())
+	}
+
+	recPost := httptest.NewRecorder()
+	mux.ServeHTTP(recPost, httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag?stage=01_main_enter&detail=ok", nil))
+	if recPost.Code != http.StatusOK || recPost.Body.String() != "ok\n" {
+		t.Fatalf("diag submit failed: code=%d body=%q", recPost.Code, recPost.Body.String())
+	}
+
+	recRecent := httptest.NewRecorder()
+	mux.ServeHTTP(recRecent, httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag/recent", nil))
+	if recRecent.Code != http.StatusOK {
+		t.Fatalf("diag recent failed: code=%d", recRecent.Code)
+	}
+	var events []diagEvent
+	if err := json.Unmarshal(recRecent.Body.Bytes(), &events); err != nil {
+		t.Fatalf("unmarshal diag recent: %v", err)
+	}
+	if len(events) != 1 || events[0].Stage != "01_main_enter" || events[0].Detail != "ok" || events[0].At == "" {
+		t.Fatalf("unexpected diag events: %+v", events)
+	}
+
+	// Sanitization of CR/LF/control chars, clamping to 64/256 bytes, and ring buffer eviction (>64 events).
+	longStage := strings.Repeat("S", 80) + "\r\nX"
+	longDetail := "a\nb\tc\r" + strings.Repeat("D", 300)
+	reqSan := httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag", nil)
+	q := reqSan.URL.Query()
+	q.Set("stage", longStage)
+	q.Set("detail", longDetail)
+	reqSan.URL.RawQuery = q.Encode()
+	mux.ServeHTTP(httptest.NewRecorder(), reqSan)
+
+	for i := 0; i < maxDiagEvents; i++ {
+		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag?stage=fill&detail=n", nil))
+	}
+
+	recRing := httptest.NewRecorder()
+	mux.ServeHTTP(recRing, httptest.NewRequest(http.MethodGet, "/api/v1/launcher/diag/recent", nil))
+	var capped []diagEvent
+	if err := json.Unmarshal(recRing.Body.Bytes(), &capped); err != nil {
+		t.Fatalf("unmarshal capped diag recent: %v", err)
+	}
+	if len(capped) != maxDiagEvents {
+		t.Fatalf("expected %d events after wrap, got %d", maxDiagEvents, len(capped))
+	}
+	for _, ev := range capped {
+		if strings.ContainsAny(ev.Stage, "\r\n") || strings.ContainsAny(ev.Detail, "\r\n") || len(ev.Stage) > 64 || len(ev.Detail) > 256 {
+			t.Fatalf("unsanitized or overlong diag event: %+v", ev)
+		}
+	}
+}

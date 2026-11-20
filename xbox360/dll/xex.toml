@@ -2,3 +2,7 @@ load_address = 0x88000000
 module_flags = ["TITLE", "DLL"]
 version = "1.0.0.0"
 tls_slots = 0
+encrypt = "retail"
+
+[imports]
+version = "2.0.17559.0"
