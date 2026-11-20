@@ -20,7 +20,9 @@ Native Xbox 360 screen-time enforcement, in-game notifications, remote Pause/Res
 - **Home Assistant Dotted Line (MQTT Auto-Discovery)**
   - Auto-registers a single **Xbox 360 Parental Control** device with `number`, `text`, `switch`, `button`, and `sensor` entities.
   - Includes a ready-to-import Home Assistant blueprint ([`homeassistant/blueprints/xbox360_more_time_approval.yaml`](homeassistant/blueprints/xbox360_more_time_approval.yaml)) for actionable mobile phone notifications (`Approve +15m`, `Approve +30m`, `Deny`).
-- **Aurora Companion Utilities (`tools/`)**
+- **Aurora Companion Utilities (`tools/`) & Custom Plex-Style Launcher (`xbox360/launcher/`)**
+  - `xbox360/launcher/` (**Shelf** — `shelf_launcher.xex`): Open-source, Grounded-Earth Warm Espresso Plex-style Xbox 360 dashboard built on `xenon-forge` with a persistent 14-genre category sidebar, 5-column poster wall, hero backdrop strip, offline `Hdd1:` thumbnail cache, and built-in **Xbox Guard** screen-time lock/PIN integration. See [`docs/LAUNCHER.md`](docs/LAUNCHER.md).
+  - `tools/launcher-sync/`: Safely reads Aurora's `content.db`, generates `catalog.tsv` plus pre-sized `180x248` posters & `640x360` backdrops, pushes updates to `xbox-guard`, and optionally seeds `Hdd1:` over FTP.
   - `tools/sideload-sync/`: Auto-generate PeerPressure `<TitleID>.ini` sideload files for Aurora + your entire game library over FTP.
   - `tools/aurora-art-sync/`: Parallel XboxUnity boxart pre-downloader that stages missing covers into Aurora's `/Game/User/Import/<TitleID>/cover.png` directory so Aurora imports hundreds of covers in seconds instead of stalling on its single-threaded downloader.
   - `tools/aurora-categories/`: One-click **Genre QuickViews** Aurora Utility Lua script + `Uncategorized` filter + `content.db` genre auditor so large libraries (500+ games) can be browsed cleanly by category instead of scrolling through one huge horizontal list.
@@ -82,8 +84,10 @@ On Ubuntu 24.04 (or Windows with Visual Studio Build Tools + `clang`):
 ```bash
 cd xbox360
 ./bootstrap.sh
-./bin/buck2 build //dll:screentime_dll //system-module:screentime_sys --show-output
+./bin/buck2 build -m release //dll:screentime_dll //system-module:screentime_sys //launcher:shelf_launcher --show-output
 ```
+
+See [`docs/LAUNCHER.md`](docs/LAUNCHER.md) for setting up **Shelf** (`shelf_launcher.xex`) safely alongside Aurora.
 
 Copy [`xbox360/screentime.cfg.example`](xbox360/screentime.cfg.example) to `screentime.cfg`, set `server_ip` to your `xbox-guard` host IP, and deploy:
 - **RGH / JTAG / ABadAvatar (`launch.ini`)**: place `screentime_sys.xex` + `screentime.cfg` on `Hdd1:\` and load `screentime_sys.xex` as a DashLaunch plugin (`plugin1 = Hdd1:\screentime_sys.xex`).
