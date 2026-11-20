@@ -99,4 +99,21 @@ func TestOpenEmptySaveReloadAndAssets(t *testing.T) {
 	if st3.GameCount != 2 || st3.PosterCount != 1 || st3.BackdropCount != 1 {
 		t.Fatalf("unexpected reloaded status: %+v", st3)
 	}
+
+	// Accept 16-column rows with local_players and reject invalid non-numeric local_players.
+	sample16 := strings.Join([]string{
+		"SHELF_CATALOG\tv1\t1700000001\t1",
+		"12\t45410912\t0E7A7EB3\tPortal 2\t2\t1\t1\tUsb0:\t\\games\\portal 2\tdefault.xex\tValve\t2011\t1\t1\tTest-chamber co-op puzzle game.\t2",
+	}, "\n") + "\n"
+	st16, err := s2.SaveCatalogTSV([]byte(sample16))
+	if err != nil || st16.GameCount != 1 {
+		t.Fatalf("expected 16-column catalog save to succeed, got st=%+v err=%v", st16, err)
+	}
+	bad16 := strings.Join([]string{
+		"SHELF_CATALOG\tv1\t1700000001\t1",
+		"12\t45410912\t0E7A7EB3\tPortal 2\t2\t1\t1\tUsb0:\t\\games\\portal 2\tdefault.xex\tValve\t2011\t1\t1\tTest-chamber co-op puzzle game.\tcoop",
+	}, "\n") + "\n"
+	if _, err := s2.SaveCatalogTSV([]byte(bad16)); err == nil {
+		t.Fatalf("expected error on non-numeric local_players column")
+	}
 }

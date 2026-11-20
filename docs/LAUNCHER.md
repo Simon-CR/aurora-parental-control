@@ -1,6 +1,6 @@
 # Shelf: Plex-Style Xbox 360 Launcher
 
-**Shelf** (`shelf_launcher.xex`) is an open-source, Plex-style Xbox 360 game launcher compiled natively with [`landaire/xenon-forge`](https://github.com/landaire/xenon-forge) in Rust. It displays a persistent left category sidebar (including all 14 Xbox 360 genres, Recently Played, Favorites, Uncategorized, and Open Aurora) paired with a 5-column poster wall, bottom details strip, and built-in **Xbox Guard** screen-time integration.
+**Shelf** (`shelf_launcher.xex`) is an open-source, Plex-style Xbox 360 game launcher compiled natively with [`landaire/xenon-forge`](https://github.com/landaire/xenon-forge) in Rust. It displays a persistent left category sidebar (including all 14 Xbox 360 genres, Recently Played, Favorites, **Local Multiplayer**, Uncategorized, and Open Aurora) paired with a 5-column poster wall, bottom details strip, and built-in **Xbox Guard** screen-time integration.
 
 ---
 
@@ -11,7 +11,7 @@
         |  (read-only FTP export via launcher_sync.py)
         v
   [2] launcher-cache/  (on xbox-guard host)
-        |-- catalog.tsv          (single 15-column game list)
+        |-- catalog.tsv          (single 16-column game list incl. local_players)
         |-- posters/<TID>.jpg    (pre-sized 180x248 JPEG cards)
         |-- backdrops/<TID>.jpg  (pre-sized 640x360 hero banners)
         |
@@ -38,6 +38,7 @@
 | `D-Pad` / `Left Stick` | Move focus across the left sidebar tabs or 5-column poster wall |
 | `A` | Open highlighted sidebar category / Launch focused game / Confirm option |
 | `B` | Return focus to the sidebar or close an open modal |
+| `Back` | Toggle **Local Multiplayer Only** filter on top of any category (`2+` local players) |
 | `LB` / `RB` | Switch to previous / next category tab from anywhere |
 | `LT` / `RT` | Cycle quick first-letter filter (`All` -> `0-9` -> `A` through `Z`) |
 | `X` | Toggle Favorite on the focused game (syncs to `xbox-guard` & `userstate.tsv`) |

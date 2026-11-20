@@ -96,6 +96,7 @@ pub struct NavState {
     pub scroll_row: usize,
     pub sort_mode: SortMode,
     pub letter_filter: LetterFilter,
+    pub local_mp_only: bool,
     pub lock_cursor: usize,
     pub entering_pin: bool,
     pub pin_buffer: Vec<u16>,
@@ -115,6 +116,7 @@ impl Default for NavState {
             scroll_row: 0,
             sort_mode: SortMode::TitleAsc,
             letter_filter: LetterFilter::All,
+            local_mp_only: false,
             lock_cursor: 0,
             entering_pin: false,
             pin_buffer: Vec::new(),
@@ -282,6 +284,12 @@ impl NavState {
                 self.scroll_row = 0;
                 return NavEvent::None;
             }
+            InputAction::Back => {
+                self.local_mp_only = !self.local_mp_only;
+                self.grid_idx = 0;
+                self.scroll_row = 0;
+                return NavEvent::None;
+            }
             _ => {}
         }
 
@@ -330,7 +338,7 @@ impl NavState {
         // FocusZone::Grid
         self.clamp_grid(filtered.len());
         match action {
-            InputAction::B | InputAction::Back => {
+            InputAction::B => {
                 self.zone = FocusZone::Sidebar;
             }
             InputAction::Left => {
@@ -522,5 +530,26 @@ mod tests {
         assert_eq!(unlock, NavEvent::PinUnlocked);
         assert_eq!(nav.zone, FocusZone::Grid);
         assert_eq!(nav.take_pending_launch(), Some(0));
+    }
+
+    #[test]
+    fn back_toggles_local_multiplayer_filter_without_leaving_zone() {
+        let mut cat = twelve_game_catalog();
+        let mut nav = NavState::default();
+        let filtered = cat.filtered_indices(nav.active_filter_tab(), nav.sort_mode, nav.letter_filter);
+
+        assert!(!nav.local_mp_only);
+        nav.grid_idx = 4;
+        nav.apply_input(InputAction::Back, &mut cat, &filtered, false, false);
+        assert!(nav.local_mp_only);
+        assert_eq!(nav.grid_idx, 0);
+        assert_eq!(nav.zone, FocusZone::Grid);
+
+        // B moves from Grid to Sidebar, Back still toggles local_mp_only in Sidebar too.
+        nav.apply_input(InputAction::B, &mut cat, &filtered, false, false);
+        assert_eq!(nav.zone, FocusZone::Sidebar);
+        nav.apply_input(InputAction::Back, &mut cat, &filtered, false, false);
+        assert!(!nav.local_mp_only);
+        assert_eq!(nav.zone, FocusZone::Sidebar);
     }
 }
