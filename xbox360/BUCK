@@ -6,3 +6,21 @@ filegroup(
     },
     visibility = ["PUBLIC"],
 )
+
+filegroup(
+    name = "launcher",
+    srcs = {
+        "shelf_launcher.xex": "//launcher:shelf_launcher",
+    },
+    visibility = ["PUBLIC"],
+)
+
+filegroup(
+    name = "all",
+    srcs = {
+        "screentime_dll.xex": "//dll:screentime_dll",
+        "screentime_sys.xex": "//system-module:screentime_sys",
+        "shelf_launcher.xex": "//launcher:shelf_launcher",
+    },
+    visibility = ["PUBLIC"],
+)

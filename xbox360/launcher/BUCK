@@ -1,0 +1,23 @@
+load("@xbox360//buck:xex.bzl", "xbox360_title")
+
+xbox360_title(
+    name = "shelf_launcher",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2024",
+    manifest = "xex.toml",
+    std = True,
+    rewrite = True,
+    deps = [
+        "//launcher-core:launcher_core",
+        "@xbox360//src/crates/xbox360:xbox360",
+        "@xbox360//src/crates/xbox360-draw:xbox360-draw",
+        "@xbox360//src/crates/xbox360-egui:xbox360-egui",
+        "@xbox360//src/crates/xbox360-gpu:xbox360-gpu",
+        "@xbox360//src/crates/xbox360-image:xbox360-image",
+        "@xbox360//src/crates/xbox360-sys:xbox360-sys",
+        "@xbox360//src/crates/xbox360-video:xbox360-video",
+        "@xbox360//third-party/rust:egui",
+    ],
+    visibility = ["PUBLIC"],
+)
