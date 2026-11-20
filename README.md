@@ -95,15 +95,19 @@ Copy [`xbox360/screentime.cfg.example`](xbox360/screentime.cfg.example) to `scre
 
 ## Speeding Up Aurora Artwork & Browsing by Category
 
-### Bulk Cover Pre-Download (`aurora-art-sync`)
-Aurora's built-in asset queue downloads covers one at a time inside the dashboard. To pre-stage missing boxart in parallel from a PC:
+### Bulk Artwork Sync (`aurora-art-sync`)
+Aurora's built-in asset queue downloads assets one at a time inside the dashboard. `aurora_art_sync.py` downloads **covers, backgrounds, icons, banners, and screenshots** (excluding videos) in parallel from XboxUnity and the Xbox CDN:
 
 ```bash
-python tools/aurora-art-sync/aurora_art_sync.py --host <xbox-ip>
-python tools/aurora-art-sync/aurora_art_sync.py --host <xbox-ip> --apply
-```
+# Pack native .asset containers directly into /Game/Data/GameData/ (Windows with asset_packer)
+python tools/aurora-art-sync/aurora_art_sync.py --host <xbox-ip> --mode asset --packer aurora_asset_packer.exe --apply
 
-Then open Aurora on the console and choose **Settings → Assets → Import** to ingest all pre-downloaded covers rapidly.
+# Or target newly installed TitleID(s) only without scanning the full library
+python tools/aurora-art-sync/aurora_art_sync.py --host <xbox-ip> --title-id 45410912,4D5307E6 --mode asset --packer aurora_asset_packer.exe --apply
+
+# Or stage raw images into /Game/User/Import/<TitleID>/ for Settings -> Assets -> Import
+python tools/aurora-art-sync/aurora_art_sync.py --host <xbox-ip> --mode import --apply
+```
 
 ### Browsing Large Libraries by Category (`aurora-categories`)
 Aurora natively supports **QuickViews** (`LB` / `RB`), **Grid / Multi-Row view** (`B` → `View`), and **A–Z letter jumping** (`LT` / `RT`). To add 1-click **Genre QuickViews** (`Family`, `Action & Adventure`, `Racing & Flying`, `Shooter`, `Platformer`, `Sports & Recreation`, etc.) plus an `Uncategorized` filter:
