@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Simon-CR/aurora-parental-control/controller/internal/catalog"
 	"github.com/Simon-CR/aurora-parental-control/controller/internal/policy"
@@ -38,6 +41,8 @@ func NewMuxWithCatalog(engine *policy.Engine, cat *catalog.Store, st *store.Stor
 	mux.HandleFunc("POST /api/v1/launcher/favorite", h.handleLauncherFavorite)
 	mux.HandleFunc("POST /api/v1/launcher/played", h.handleLauncherPlayed)
 	mux.HandleFunc("GET /api/v1/launcher/status", h.handleLauncherStatus)
+	mux.HandleFunc("GET /api/v1/launcher/diag", h.handleLauncherDiag)
+	mux.HandleFunc("GET /api/v1/launcher/diag/recent", h.handleLauncherDiagRecent)
 
 	mux.HandleFunc("GET /api/v1/status", h.handleStatus)
 	mux.HandleFunc("POST /api/v1/policy", h.handleUpdatePolicy)
@@ -48,10 +53,21 @@ func NewMuxWithCatalog(engine *policy.Engine, cat *catalog.Store, st *store.Stor
 	return mux
 }
 
+const maxDiagEvents = 64
+
+type diagEvent struct {
+	At         string `json:"at"`
+	Stage      string `json:"stage"`
+	Detail     string `json:"detail"`
+	RemoteAddr string `json:"remote_addr"`
+}
+
 type handler struct {
-	engine  *policy.Engine
-	catalog *catalog.Store
-	store   *store.Store
+	engine     *policy.Engine
+	catalog    *catalog.Store
+	store      *store.Store
+	diagMu     sync.Mutex
+	diagEvents []diagEvent
 }
 
 func (h *handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -358,6 +374,57 @@ func (h *handler) handleLauncherStatus(w http.ResponseWriter, _ *http.Request) {
 		st = catalog.Status{CatalogVersion: "empty"}
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+func sanitizeDiagField(raw string, maxBytes int) string {
+	s := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(raw))
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		cut = i
+	}
+	return s[:cut]
+}
+
+func (h *handler) handleLauncherDiag(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	stage := sanitizeDiagField(q.Get("stage"), 64)
+	detail := sanitizeDiagField(q.Get("detail"), 256)
+	ev := diagEvent{
+		At:         time.Now().UTC().Format(time.RFC3339Nano),
+		Stage:      stage,
+		Detail:     detail,
+		RemoteAddr: r.RemoteAddr,
+	}
+
+	h.diagMu.Lock()
+	h.diagEvents = append(h.diagEvents, ev)
+	if len(h.diagEvents) > maxDiagEvents {
+		h.diagEvents = append([]diagEvent(nil), h.diagEvents[len(h.diagEvents)-maxDiagEvents:]...)
+	}
+	h.diagMu.Unlock()
+
+	log.Printf("launcher diag stage=%s detail=%s from=%s", stage, detail, r.RemoteAddr)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, "ok\n")
+}
+
+func (h *handler) handleLauncherDiagRecent(w http.ResponseWriter, _ *http.Request) {
+	h.diagMu.Lock()
+	events := make([]diagEvent, len(h.diagEvents))
+	copy(events, h.diagEvents)
+	h.diagMu.Unlock()
+	writeJSON(w, http.StatusOK, events)
 }
 
 func wantsJSON(r *http.Request) bool {
