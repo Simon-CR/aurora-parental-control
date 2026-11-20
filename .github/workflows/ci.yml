@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+
+jobs:
+  controller-go:
+    name: Controller (Go Tests & Build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: controller
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go vet ./...
+      - run: go test -race -v ./...
+      - run: CGO_ENABLED=0 go build -o /tmp/xbox-guard ./cmd/xbox-guard
+
+  tools-python:
+    name: Tools (Python Syntax Check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile tools/sideload-sync/sideload_sync.py tools/aurora-art-sync/aurora_art_sync.py tools/aurora-categories/aurora_categories.py
+
+  xbox360-shared-tests:
+    name: Xbox 360 Shared Logic Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: xbox360/shared
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test

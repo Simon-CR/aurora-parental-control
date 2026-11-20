@@ -1,0 +1,18 @@
+load("@xbox360//buck:xex.bzl", "xbox360_title")
+
+xbox360_title(
+    name = "screentime_sys",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2024",
+    manifest = "xex.toml",
+    rust_project = "Cargo.toml",
+    std = "system",
+    rewrite = True,
+    deps = [
+        "//shared:shared",
+        "//third-party/rust:xbox360",
+        "//third-party/rust:xbox360-sys",
+    ],
+    visibility = ["PUBLIC"],
+)

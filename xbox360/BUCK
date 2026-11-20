@@ -1,0 +1,8 @@
+filegroup(
+    name = "plugins",
+    srcs = {
+        "screentime_dll.xex": "//dll:screentime_dll",
+        "screentime_sys.xex": "//system-module:screentime_sys",
+    },
+    visibility = ["PUBLIC"],
+)

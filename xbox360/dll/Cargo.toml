@@ -1,0 +1,10 @@
+[package]
+name = "screentime-dll"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[target.'cfg(target_os = "xbox360")'.dependencies]
+screentime-shared = { path = "../shared" }
+xbox360 = "0.2"
+xbox360-sys = "0.2"

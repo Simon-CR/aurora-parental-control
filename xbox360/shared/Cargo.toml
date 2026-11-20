@@ -1,0 +1,16 @@
+[package]
+name = "screentime-shared"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "screentime_shared"
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("xbox360"))'] }
+
+[target.'cfg(target_os = "xbox360")'.dependencies]
+xbox360 = "0.2"
+xbox360-sys = "0.2"
