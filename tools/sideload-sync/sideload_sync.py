@@ -40,7 +40,9 @@ def fetch_bytes(ftp: ftplib.FTP, remote_path: str) -> bytes:
 def list_files(ftp: ftplib.FTP, directory: str) -> dict[str, int]:
     entries: dict[str, int] = {}
     lines: list[str] = []
-    ftp.retrlines(f"LIST {directory}", lines.append)
+    # Aurora's FtpDll ignores path args on LIST unless CWD is set first.
+    ftp.cwd(directory)
+    ftp.retrlines("LIST", lines.append)
     for line in lines:
         parts = line.split(maxsplit=8)
         if len(parts) < 9:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ftplib
+import http.client
 import io
 import json
 import os
@@ -12,8 +13,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -22,8 +22,9 @@ CONTENT_DB_PATH = "/Game/Data/Databases/content.db"
 GAMEDATA_ROOT = "/Game/Data/GameData"
 DEFAULT_IMPORT_ROOT = "/Game/User/Import"
 COVER_MIN_ASSET_BYTES = 24_576
-COVER_INFO_URL = "http://xboxunity.net/Resources/Lib/CoverInfo.php?titleid={tid}"
-COVER_IMG_URL = "http://xboxunity.net/Resources/Lib/Cover.php?size={size}&cid={cid}"
+XBOXUNITY_HOST = "xboxunity.net"
+COVER_INFO_PATH = "/Resources/Lib/CoverInfo.php?titleid={tid}"
+COVER_IMG_PATH = "/Resources/Lib/Cover.php?size={size}&cid={cid}"
 USER_AGENT = "Aurora/0.7b"
 
 
@@ -66,13 +67,12 @@ class PersistentFTP:
                     self.connect()
                 assert self.ftp is not None
                 return fn(self.ftp)
-            except (ftplib.error_temp, ftplib.error_perm) as exc:
-                # Propagate permanent 5xx errors (e.g. missing path) directly except timeouts.
-                if isinstance(exc, ftplib.error_perm) and not str(exc).startswith("550"):
-                    last_err = exc
-                    self.connect()
-                    continue
-                raise
+            except ftplib.error_perm as exc:
+                # Propagate permanent 550 (missing path) immediately; reconnect other transient perms.
+                if str(exc).startswith("550"):
+                    raise
+                last_err = exc
+                self.connect()
             except (EOFError, OSError, TimeoutError, ftplib.all_errors) as exc:
                 last_err = exc
                 if attempt < 2:
@@ -90,10 +90,12 @@ class PersistentFTP:
         return self._run(op)
 
     def list_dir(self, remote_dir: str) -> list[tuple[bool, str, int]]:
-        """Returns list of (is_dir, name, size) tuples."""
+        """Returns list of (is_dir, name, size) tuples inside remote_dir."""
         def op(ftp: ftplib.FTP) -> list[tuple[bool, str, int]]:
+            # Aurora FtpDll ignores arguments to LIST and lists "/" unless CWD is set first.
+            ftp.cwd(remote_dir)
             lines: list[str] = []
-            ftp.retrlines(f"LIST {remote_dir}", lines.append)
+            ftp.retrlines("LIST", lines.append)
             out: list[tuple[bool, str, int]] = []
             for line in lines:
                 parts = line.split(maxsplit=8)
@@ -118,12 +120,19 @@ class PersistentFTP:
         for part in parts:
             cur += "/" + part
             try:
-                self._run(lambda f, d=cur: f.mkd(d))
+                self._run(lambda f, d=cur: f.cwd(d))
             except ftplib.error_perm:
-                pass
+                try:
+                    self._run(lambda f, d=cur: f.mkd(d))
+                except ftplib.error_perm:
+                    pass
 
-    def stor_bytes(self, remote_path: str, data: bytes) -> None:
-        self._run(lambda f: f.storbinary(f"STOR {remote_path}", io.BytesIO(data)))
+    def stor_bytes(self, remote_dir: str, filename: str, data: bytes) -> None:
+        def op(ftp: ftplib.FTP) -> None:
+            ftp.cwd(remote_dir)
+            ftp.storbinary(f"STOR {filename}", io.BytesIO(data))
+
+        self._run(op)
 
     def close(self) -> None:
         if self.ftp is not None:
@@ -168,33 +177,99 @@ def load_content_titles(db_bytes: bytes) -> dict[str, list[TitleRecord]]:
 
 
 class AdaptiveRateLimiter:
-    """Caps concurrency and backs off temporarily when XboxUnity returns 429/5xx."""
+    """Bounds concurrent XboxUnity requests and throttles down on HTTP 429/5xx."""
 
-    def __init__(self, max_workers: int) -> None:
+    def __init__(self, max_workers: int, min_interval_sec: float = 0.08) -> None:
         self.max_workers = max(1, max_workers)
-        self.min_workers = min(4, self.max_workers)
+        self._sem = threading.Semaphore(self.max_workers)
         self._lock = threading.Lock()
-        self._active_limit = self.max_workers
+        self._min_interval = min_interval_sec
+        self._next_allowed = 0.0
         self._cooldown_until = 0.0
+        self._throttled = False
 
-    def wait_slot(self) -> None:
+    def __enter__(self) -> AdaptiveRateLimiter:
+        self._sem.acquire()
         while True:
+            now = time.monotonic()
             with self._lock:
-                delay = self._cooldown_until - time.monotonic()
-            if delay <= 0:
-                return
+                wait_until = max(self._cooldown_until, self._next_allowed)
+                if now >= wait_until:
+                    self._next_allowed = now + self._min_interval
+                    return self
+                delay = wait_until - now
             time.sleep(min(delay, 1.0))
+
+    def __exit__(self, *_exc) -> None:
+        self._sem.release()
 
     def penalize(self, backoff_sec: float) -> None:
         with self._lock:
-            self._active_limit = max(self.min_workers, self._active_limit // 2)
+            self._min_interval = min(0.6, max(self._min_interval * 1.5, 0.25))
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + backoff_sec)
+            if not self._throttled and self.max_workers > 2:
+                self._throttled = True
+                # Permanently reduce effective semaphore capacity by half when throttled.
+                for _ in range(max(1, self.max_workers // 2)):
+                    self._sem.acquire(blocking=False)
 
 
-def http_get(url: str, timeout: int = 12) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+class HTTPTransientError(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+_thread_local = threading.local()
+
+
+def _get_conn() -> http.client.HTTPConnection:
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = http.client.HTTPConnection(XBOXUNITY_HOST, 80, timeout=12)
+        _thread_local.conn = conn
+    return conn
+
+
+def _reset_conn() -> None:
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
+
+
+def http_get(path: str) -> bytes:
+    """Performs an HTTP/1.1 keep-alive GET against xboxunity.net."""
+    headers = {"User-Agent": USER_AGENT, "Connection": "keep-alive"}
+    for hop in range(3):
+        conn = _get_conn()
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+        except Exception:
+            _reset_conn()
+            raise
+
+        if resp.status in (301, 302, 303, 307, 308):
+            loc = resp.getheader("Location", "")
+            parsed = urllib.parse.urlsplit(loc)
+            path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            if parsed.netloc and parsed.netloc.lower() != XBOXUNITY_HOST:
+                _reset_conn()
+                raise HTTPTransientError(resp.status)
+            continue
+        if resp.status in (429, 500, 502, 503, 504):
+            _reset_conn()
+            raise HTTPTransientError(resp.status)
+        if resp.status != 200:
+            raise HTTPTransientError(resp.status)
+        return body
+
+    raise HTTPTransientError(503)
 
 
 def pick_best_cover_id(info_json: dict) -> str | None:
@@ -234,42 +309,42 @@ def fetch_cover_for_title(
         if is_valid_image(data):
             return tid_hex, "cached", data
 
-    for attempt in range(3):
-        limiter.wait_slot()
-        try:
-            raw_info = http_get(COVER_INFO_URL.format(tid=tid_hex))
-            info = json.loads(raw_info.decode("utf-8", "replace"))
-            cid = pick_best_cover_id(info)
-            if not cid:
-                return tid_hex, "missing", None
+    for attempt in range(5):
+        with limiter:
+            try:
+                raw_info = http_get(COVER_INFO_PATH.format(tid=tid_hex))
+                info = json.loads(raw_info.decode("utf-8", "replace"))
+                cid = pick_best_cover_id(info)
+                if not cid:
+                    return tid_hex, "missing", None
 
-            img_bytes = b""
-            for size in ("large", "small"):
-                try:
-                    candidate = http_get(COVER_IMG_URL.format(size=size, cid=cid))
-                    if is_valid_image(candidate):
-                        img_bytes = candidate
-                        break
-                except urllib.error.HTTPError as exc:
-                    if exc.code in (429, 500, 502, 503, 504):
-                        raise
-            if not img_bytes:
-                return tid_hex, "missing", None
+                img_bytes = b""
+                for size in ("large", "small"):
+                    try:
+                        candidate = http_get(COVER_IMG_PATH.format(size=size, cid=cid))
+                        if is_valid_image(candidate):
+                            img_bytes = candidate
+                            break
+                    except HTTPTransientError as exc:
+                        if exc.code in (429, 500, 502, 503, 504):
+                            raise
+                if not img_bytes:
+                    return tid_hex, "missing", None
 
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, "wb") as f:
-                f.write(img_bytes)
-            return tid_hex, "downloaded", img_bytes
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
-                limiter.penalize(1.5 * (2**attempt))
-                continue
-            return tid_hex, "error", None
-        except Exception:
-            if attempt < 2:
-                time.sleep(0.75 * (attempt + 1))
-                continue
-            return tid_hex, "error", None
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    f.write(img_bytes)
+                return tid_hex, "downloaded", img_bytes
+            except HTTPTransientError as exc:
+                if exc.code in (429, 500, 502, 503, 504) and attempt < 4:
+                    limiter.penalize(min(8.0, 1.5 * (2**attempt)))
+                    continue
+                return tid_hex, "error", None
+            except Exception:
+                if attempt < 4:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return tid_hex, "error", None
 
     return tid_hex, "error", None
 
@@ -328,7 +403,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=21, help="FTP port (default: 21)")
     parser.add_argument("--user", default="xboxftp", help="FTP username (default: xboxftp)")
     parser.add_argument("--password", default="xboxftp", help="FTP password (default: xboxftp)")
-    parser.add_argument("--workers", type=int, default=16, help="Parallel XboxUnity workers (default: 16)")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel XboxUnity workers (default: 4)")
     parser.add_argument("--cache-dir", default=".art_cache", help="Local image cache directory")
     parser.add_argument("--import-root", default=DEFAULT_IMPORT_ROOT, help="Aurora Import folder over FTP")
     parser.add_argument("--limit", type=int, default=0, help="Optional cap on titles to process (0 = all)")
@@ -373,7 +448,7 @@ def main() -> int:
                 target_dir = f"{args.import_root}/{tid_hex}"
                 try:
                     ftp.ensure_dir(target_dir)
-                    ftp.stor_bytes(f"{target_dir}/cover.png", data)
+                    ftp.stor_bytes(target_dir, "cover.png", data)
                     uploaded += 1
                 except Exception as exc:
                     upload_errors += 1
