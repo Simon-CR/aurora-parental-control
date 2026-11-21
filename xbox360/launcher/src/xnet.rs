@@ -11,7 +11,7 @@ use xbox360_sys::xam::{
     XnetStartupFlags, XnetStartupParams,
 };
 
-const SO_INSECURE: SocketOption = SocketOption(0x5801);
+pub const SO_INSECURE: SocketOption = SocketOption(0x5801);
 const WSAEWOULDBLOCK: u32 = 10035;
 const WSAEINPROGRESS: u32 = 10036;
 const MAX_CONSECUTIVE_DIAG_FAILS: u32 = 2;
@@ -55,7 +55,7 @@ pub fn init_once() -> (u32, i32, u32) {
     res
 }
 
-struct SocketGuard(Socket);
+pub struct SocketGuard(pub Socket);
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {

@@ -3,6 +3,7 @@
 #![no_main]
 
 mod assets;
+mod debug_server;
 mod diag;
 mod launch;
 mod net_worker;
@@ -12,9 +13,10 @@ mod xnet;
 
 use std::fs;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use launcher_core::catalog::Catalog;
+use launcher_core::debug_proto::RenderOverride;
 use launcher_core::guard::{
     GuardStatus, LauncherConfig, VK_PAD_DPAD_DOWN, VK_PAD_DPAD_LEFT, VK_PAD_DPAD_RIGHT,
     VK_PAD_DPAD_UP,
@@ -22,7 +24,7 @@ use launcher_core::guard::{
 use launcher_core::launch_plan::{LaunchTarget, plan_aurora_launch, plan_game_launch};
 use launcher_core::nav::{FocusZone, InputAction, NavEvent, NavState};
 use xbox360::xam::input;
-use xbox360_draw::draw::DrawList;
+use xbox360_draw::draw::{DrawList, Rgba8};
 use xbox360_egui::Painter;
 use xbox360_gpu::Gpu;
 use xbox360_sys::mmio::GpuRegisters;
@@ -57,6 +59,29 @@ xbox360::sys::bridged!(#[unsafe(no_mangle)] pub _start, main);
 
 extern "C" fn main(_context: u32) -> u32 {
     diag::reset_log();
+    std::panic::set_hook(Box::new(|info| {
+        match diag::handle_panic(&format!("{info}")) {
+            diag::PanicAction::ParkWorkerOrDebug => {
+                if diag::debug_panicked() {
+                    debug_server::mark_down_on_panic();
+                }
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            diag::PanicAction::ParkUiIfDebug => {
+                if debug_server::is_spawned() && !diag::debug_panicked() {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                xbox360::title::return_to_dashboard();
+            }
+            diag::PanicAction::Unregistered => {
+                xbox360::title::return_to_dashboard();
+            }
+        }
+    }));
     diag::stage("01_main_enter", "entered _start -> main");
     let join = std::thread::Builder::new()
         .stack_size(UI_STACK_BYTES)
@@ -204,23 +229,68 @@ fn process_keystroke(
     )
 }
 
+fn park_on_fatal(
+    cfg: &LauncherConfig,
+    debug_srv: &mut Option<debug_server::DebugServer>,
+    reason: &str,
+) {
+    diag::stage(
+        "fatal_park",
+        &format!("{reason}; debug server active on tcp/7331 (send 'dash'/'aurora' or press B)"),
+    );
+    loop {
+        while let Some(ks) = input::next_keystroke() {
+            if ks.flags.contains(KeystrokeFlags::KEY_DOWN)
+                && matches!(PadKey::from_raw(ks.virtual_key), Some(PadKey::B | PadKey::Start))
+            {
+                if let Some(srv) = debug_srv.take() {
+                    srv.shutdown();
+                }
+                return;
+            }
+        }
+        match debug_server::take_remote_action() {
+            1 => {
+                debug_server::acknowledge_remote_action();
+                if let Some(srv) = debug_srv.take() {
+                    srv.shutdown();
+                }
+                return;
+            }
+            2 => {
+                if let Ok(target) = plan_aurora_launch(&cfg.aurora_path) {
+                    debug_server::acknowledge_remote_action();
+                    if let Some(srv) = debug_srv.take() {
+                        srv.shutdown();
+                    }
+                    let _ = launch::execute_launch(&target);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn run_app() {
+    diag::register_thread(diag::ThreadRole::Ui);
     diag::stage("02_ui_thread_start", "1MB stack running");
     let (cfg, cfg_src) = load_config();
     if let Some(ip) = cfg.server_ip {
-        let (link, xnet_rc, wsa_rc) = xnet::init_once();
         diag::set_server(ip, cfg.server_port);
         diag::stage(
             "03_cfg_loaded",
             &format!("src={cfg_src} cache={} port={}", cfg.cache_dir, cfg.server_port),
         );
-        diag::stage(
-            "04_xnet_init",
-            &format!("link=0x{link:x} xnet={xnet_rc} wsa={wsa_rc}"),
-        );
     } else {
         diag::stage("03_cfg_loaded", &format!("offline src={cfg_src}"));
     }
+    let (link, xnet_rc, wsa_rc) = xnet::init_once();
+    diag::stage(
+        "04_xnet_init",
+        &format!("link=0x{link:x} xnet={xnet_rc} wsa={wsa_rc}"),
+    );
 
     let (mut vd_info, ctrl, primary_addr) = query_vd_info();
     diag::stage(
@@ -241,6 +311,8 @@ fn run_app() {
 
     let mut catalog = load_cached_catalog(&cfg.cache_dir);
     diag::stage("06_catalog_loaded", &format!("games={}", catalog.entries().len()));
+
+    let mut debug_srv = Some(debug_server::DebugServer::spawn(cfg.aurora_path.clone()));
 
     let mut nav = NavState::default();
     let mut guard = GuardStatus::default();
@@ -270,11 +342,13 @@ fn run_app() {
                         Ok(d) => d,
                         Err(err2) => {
                             diag::stage("07_display_fatal", &format!("{err2}"));
+                            park_on_fatal(&cfg, &mut debug_srv, &format!("Display::new: {err2}"));
                             return;
                         }
                     }
                 } else {
                     diag::stage("07_display_fatal", &format!("{error}"));
+                    park_on_fatal(&cfg, &mut debug_srv, &format!("Display::new: {error}"));
                     return;
                 }
             }
@@ -298,6 +372,8 @@ fn run_app() {
             Ok(g) => g,
             Err(error) => {
                 diag::stage("09_gpu_new_err", &format!("{error}"));
+                drop(display);
+                park_on_fatal(&cfg, &mut debug_srv, &format!("Gpu::new: {error}"));
                 return;
             }
         };
@@ -312,8 +388,30 @@ fn run_app() {
         diag::stage("10_worker_spawned", "network/art worker thread started");
         let start = Instant::now();
         let mut frame_num: u32 = 0;
+        let mut gpu_frame_num: u32 = 0;
+        let mut cpu_fill: Option<(u32, Vec<u32>)> = None;
 
         let pending_action = loop {
+            diag::record_frame(frame_num);
+
+            match debug_server::take_remote_action() {
+                1 => {
+                    debug_server::acknowledge_remote_action();
+                    break PendingAction::Exit;
+                }
+                2 => match plan_aurora_launch(&cfg.aurora_path) {
+                    Ok(target) => {
+                        debug_server::acknowledge_remote_action();
+                        break PendingAction::Launch {
+                            target,
+                            played_tid: None,
+                        };
+                    }
+                    Err(err) => nav.set_launch_error(err),
+                },
+                _ => {}
+            }
+
             while let Some(msg) = worker.try_recv() {
                 match msg {
                     WorkerMsg::CatalogLoaded { catalog: next_cat } => {
@@ -456,69 +554,110 @@ fn run_app() {
                 });
             }
 
-            let raw_input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(size.width as f32, size.height as f32),
-                )),
-                time: Some(start.elapsed().as_secs_f64()),
-                ..egui::RawInput::default()
-            };
+            let mut is_gpu_frame = true;
+            match debug_server::render_override() {
+                RenderOverride::CpuSolid(r, g, b) => {
+                    is_gpu_frame = false;
+                    let pixel = (u32::from(b) << 16) | (u32::from(g) << 8) | u32::from(r);
+                    let buf = match cpu_fill {
+                        Some((ref mut prev_px, ref mut vec)) => {
+                            if *prev_px != pixel {
+                                vec.fill(pixel);
+                                *prev_px = pixel;
+                            }
+                            vec.as_slice()
+                        }
+                        None => {
+                            cpu_fill = Some((pixel, vec![pixel; 320 * 180]));
+                            cpu_fill.as_ref().map(|(_, v)| v.as_slice()).unwrap_or(&[])
+                        }
+                    };
+                    if let Some(frame) =
+                        FrameView::new(buf, FrameSize { width: 320, height: 180 }, 320)
+                    {
+                        display.present(frame);
+                    }
+                }
+                RenderOverride::GpuSolid(r, g, b) => {
+                    list.clear();
+                    list.set_clear_color(Some(Rgba8::new(r, g, b, 0xFF)));
+                    if gpu_frame_num == 0 {
+                        diag::stage("13_frame1_render_begin", "calling gpu.render (solid override)");
+                    }
+                    if let Err(error) = gpu.render(&mut display, &list) {
+                        diag::stage("13_frame1_render_err", &format!("frame={frame_num} err={error}"));
+                        break PendingAction::Exit;
+                    }
+                }
+                RenderOverride::Normal => {
+                    let raw_input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(size.width as f32, size.height as f32),
+                        )),
+                        time: Some(start.elapsed().as_secs_f64()),
+                        ..egui::RawInput::default()
+                    };
 
-            let notice_text = notice.as_ref().map(|(s, _)| s.as_str());
-            let output = context.run(raw_input, |ctx| {
-                ui::draw_launcher_ui(
-                    ctx,
-                    &catalog,
-                    &filtered,
-                    &nav,
-                    &guard,
-                    pin_override,
-                    &textures,
-                    notice_text,
-                );
-            });
-            let shapes_len = output.shapes.len();
-            let tex_set_len = output.textures_delta.set.len();
-            let primitives = context.tessellate(output.shapes, output.pixels_per_point);
-            if frame_num == 0 {
-                diag::stage(
-                    "11_frame1_egui_ok",
-                    &format!(
-                        "shapes={shapes_len} prims={} tex_set={tex_set_len}",
-                        primitives.len()
-                    ),
-                );
+                    let notice_text = notice.as_ref().map(|(s, _)| s.as_str());
+                    let output = context.run(raw_input, |ctx| {
+                        ui::draw_launcher_ui(
+                            ctx,
+                            &catalog,
+                            &filtered,
+                            &nav,
+                            &guard,
+                            pin_override,
+                            &textures,
+                            notice_text,
+                        );
+                    });
+                    let shapes_len = output.shapes.len();
+                    let tex_set_len = output.textures_delta.set.len();
+                    let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+                    if gpu_frame_num == 0 {
+                        diag::stage(
+                            "11_frame1_egui_ok",
+                            &format!(
+                                "shapes={shapes_len} prims={} tex_set={tex_set_len}",
+                                primitives.len()
+                            ),
+                        );
+                    }
+                    list.clear();
+                    list.set_clear_color(Some(theme::CLEAR_BG));
+                    if let Err(error) = painter.paint(
+                        &mut gpu,
+                        &mut list,
+                        &output.textures_delta,
+                        &primitives,
+                        PIXELS_PER_POINT,
+                    ) {
+                        diag::stage("frame_paint_err", &format!("frame={frame_num} err={error}"));
+                        break PendingAction::Exit;
+                    }
+                    if gpu_frame_num == 0 {
+                        diag::stage(
+                            "12_frame1_paint_ok",
+                            &format!("tris={} cmds={}", list.triangles().len(), list.commands().len()),
+                        );
+                        diag::stage("13_frame1_render_begin", "calling gpu.render");
+                    }
+                    if let Err(error) = gpu.render(&mut display, &list) {
+                        diag::stage("13_frame1_render_err", &format!("frame={frame_num} err={error}"));
+                        break PendingAction::Exit;
+                    }
+                }
             }
-            list.clear();
-            list.set_clear_color(Some(theme::CLEAR_BG));
-            if let Err(error) = painter.paint(
-                &mut gpu,
-                &mut list,
-                &output.textures_delta,
-                &primitives,
-                PIXELS_PER_POINT,
-            ) {
-                diag::stage("frame_paint_err", &format!("frame={frame_num} err={error}"));
-                break PendingAction::Exit;
-            }
-            if frame_num == 0 {
-                diag::stage(
-                    "12_frame1_paint_ok",
-                    &format!("tris={} cmds={}", list.triangles().len(), list.commands().len()),
-                );
-                diag::stage("13_frame1_render_begin", "calling gpu.render");
-            }
-            if let Err(error) = gpu.render(&mut display, &list) {
-                diag::stage("13_frame1_render_err", &format!("frame={frame_num} err={error}"));
-                break PendingAction::Exit;
-            }
-            if frame_num == 0 {
-                diag::stage("13_frame1_render_ok", "first GPU frame submitted");
-            } else if frame_num == 1 {
-                diag::stage("14_frame2_render_ok", "GPU flip #1 latched cleanly");
-            } else if frame_num == 9 {
-                diag::stage("15_frame10_ok", "steady-state rendering active");
+            if is_gpu_frame {
+                if gpu_frame_num == 0 {
+                    diag::stage("13_frame1_render_ok", "first GPU frame submitted");
+                } else if gpu_frame_num == 1 {
+                    diag::stage("14_frame2_render_ok", "GPU flip #1 latched cleanly");
+                } else if gpu_frame_num == 9 {
+                    diag::stage("15_frame10_ok", "steady-state rendering active");
+                }
+                gpu_frame_num = gpu_frame_num.saturating_add(1);
             }
             frame_num = frame_num.saturating_add(1);
         };
@@ -532,6 +671,9 @@ fn run_app() {
                 drop(list);
                 drop(gpu);
                 drop(display);
+                if let Some(srv) = debug_srv.take() {
+                    srv.shutdown();
+                }
                 return;
             }
             PendingAction::Launch { target, played_tid } => {
@@ -549,11 +691,15 @@ fn run_app() {
                 drop(list);
                 drop(gpu);
                 drop(display);
+                if let Some(srv) = debug_srv.take() {
+                    srv.shutdown();
+                }
 
                 if let Err(err) = launch::execute_launch(&target) {
                     diag::stage("launch_err", &err);
                     nav.set_launch_error(err);
                     (vd_info, _, _) = query_vd_info();
+                    debug_srv = Some(debug_server::DebugServer::spawn(cfg.aurora_path.clone()));
                     continue;
                 }
                 return;

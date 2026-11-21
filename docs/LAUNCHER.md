@@ -95,3 +95,23 @@ Launch **`shelf_launcher.xex`** directly from Aurora's File Manager to verify:
 3. Favorites (`X`), Screen-Time lock prompts, and **Open Aurora (`Start`)** work as expected.
 
 Only after testing confirms all formats launch cleanly should you optionally point `PeerPressure/System/Config.ini` at `shelf_launcher.xex` as your default dashboard.
+
+---
+
+## Live Remote Debug Console (TCP 7331)
+
+`shelf_launcher.xex` embeds a retail-safe TCP debug server (`SHELFDBG/1`) listening on port `7331` before video/GPU initialization so display or shader issues can be inspected and recovered live without power-cycling the console.
+
+```bash
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> status
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> log
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> gpu
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> modes
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> cpu C87A4B     # Direct CPU scanout fill test
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> solid 3A5230   # GPU clear-only test
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> solid off      # Return to normal UI
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> aurora         # Cleanly exit back to Aurora
+python tools/xbox-debug/xbox_debug.py --host <xbox-ip> repl           # Interactive debug prompt
+```
+
+If a fatal display error or panic occurs inside the launcher, the debug server stays open and responsive on port `7331` so you can capture registers/logs and recover remotely with `dash`, `aurora`, or `reboot`.
