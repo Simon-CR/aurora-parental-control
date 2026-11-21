@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -43,21 +45,26 @@ pub enum WorkerMsg {
 pub struct NetWorker {
     cmd_tx: Sender<WorkerCmd>,
     msg_rx: Receiver<WorkerMsg>,
+    stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl NetWorker {
     pub fn spawn(cfg: LauncherConfig) -> Self {
+        diag::clear_worker_panicked();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (msg_tx, msg_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let join = thread::Builder::new()
             .name(String::from("shelf-worker"))
             .stack_size(256 * 1024)
-            .spawn(move || worker_loop(cfg, cmd_rx, msg_tx))
+            .spawn(move || worker_loop(cfg, cmd_rx, msg_tx, worker_stop))
             .ok();
         Self {
             cmd_tx,
             msg_rx,
+            stop,
             join,
         }
     }
@@ -71,8 +78,11 @@ impl NetWorker {
     }
 
     pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(WorkerCmd::Shutdown);
-        if let Some(handle) = self.join.take() {
+        if let Some(handle) = self.join.take()
+            && !diag::worker_panicked()
+        {
             let _ = handle.join();
         }
     }
@@ -158,10 +168,17 @@ fn sync_startup_from_server(
     cfg: &LauncherConfig,
     ep: &([u8; 4], u16, String),
     msg_tx: &Sender<WorkerMsg>,
+    stop: &AtomicBool,
 ) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
     let st = poll_heartbeat(ep);
     let hb_online = st.online;
     let _ = msg_tx.send(WorkerMsg::GuardUpdated(st));
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
 
     let cat_req = format_get(catalog_path(), &ep.2);
     let mut cat_detail = String::from("err");
@@ -177,6 +194,9 @@ fn sync_startup_from_server(
         }
     }
     diag::stage("worker_sync", &format!("hb_online={hb_online} {cat_detail}"));
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
 
     let us_req = format_get(userstate_path(), &ep.2);
     if let Ok((200, body)) = http_exchange(ep.0, ep.1, &us_req, MAX_TSV_BYTES)
@@ -188,18 +208,44 @@ fn sync_startup_from_server(
     }
 }
 
-fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<WorkerMsg>) {
+fn worker_loop(
+    cfg: LauncherConfig,
+    cmd_rx: Receiver<WorkerCmd>,
+    msg_tx: Sender<WorkerMsg>,
+    stop: Arc<AtomicBool>,
+) {
+    diag::register_thread(diag::ThreadRole::Worker);
     ensure_cache_dirs(&cfg.cache_dir);
     let ep = endpoint(&cfg);
 
     if let Some(ref server) = ep {
-        sync_startup_from_server(&cfg, server, &msg_tx);
+        sync_startup_from_server(&cfg, server, &msg_tx, &stop);
     }
 
     let poll_every = Duration::from_secs(u64::from(cfg.poll_interval_sec.max(2)));
     let mut last_hb = Instant::now();
 
     loop {
+        if stop.load(Ordering::Acquire) {
+            while let Ok(item) = cmd_rx.try_recv() {
+                match item {
+                    WorkerCmd::SetFavorite { title_id, favorite } => {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
+                            let req = format_post(&favorite_path(&title_id, favorite), host_hdr);
+                            let _ = http_exchange(*ip, *port, &req, 4096);
+                        }
+                    }
+                    WorkerCmd::RecordPlayed { title_id } => {
+                        if let Some((ip, port, host_hdr)) = ep.as_ref() {
+                            let req = format_post(&played_path(&title_id), host_hdr);
+                            let _ = http_exchange(*ip, *port, &req, 4096);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         let cmd = match cmd_rx.recv_timeout(Duration::from_millis(80)) {
             Ok(cmd) => Some(cmd),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -212,12 +258,16 @@ fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<
                 batch.push(more);
             }
             for item in batch {
+                let stopping = stop.load(Ordering::Acquire);
                 match item {
                     WorkerCmd::Shutdown => return,
                     WorkerCmd::LoadPoster {
                         title_id,
                         fetch_remote,
                     } => {
+                        if stopping {
+                            continue;
+                        }
                         let img = load_or_fetch_art(
                             &cfg.cache_dir,
                             "posters",
@@ -235,6 +285,9 @@ fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<
                         title_id,
                         fetch_remote,
                     } => {
+                        if stopping {
+                            continue;
+                        }
                         let img = load_or_fetch_art(
                             &cfg.cache_dir,
                             "backdrops",
@@ -302,7 +355,8 @@ fn worker_loop(cfg: LauncherConfig, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<
             }
         }
 
-        if let Some(ref server) = ep
+        if !stop.load(Ordering::Acquire)
+            && let Some(ref server) = ep
             && last_hb.elapsed() >= poll_every
         {
             last_hb = Instant::now();
