@@ -12,35 +12,39 @@ import xbox_debug
 
 class MockShelfHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        self.wfile.write(b"SHELFDBG/1 ready (type 'help')\n")
-        self.wfile.flush()
-        while True:
-            raw = self.rfile.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace").strip()
-            self.server.received.append(line)  # type: ignore[attr-defined]
-            if line == "ping":
-                self.wfile.write(b"pong uptime_ms=123 stage=15_frame10_ok frame=12 mode=normal\n.END\n")
-            elif line.startswith("log"):
-                self.wfile.write(b"[+10ms] [01_main_enter] ok\n[+20ms] [05_vd_info] surf=1280x720\n.END\n")
-            elif line == "gpu":
-                self.wfile.write(b"reg[0x1841] (SCANOUT_CTRL) = 0x00000100\nreg[0x1844] (SCANOUT_ADDR) = 0x01000000\n.END\n")
-            elif line == "modes":
-                self.wfile.write(b"modes_count=1 total_seen=1\n[0] 1280x720 @ 60.00Hz kind=3 flags=0x00000000 (progressive)\n.END\n")
-            elif line.startswith(("solid ", "cpu ")):
-                self.wfile.write(f"OK {line}\n.END\n".encode("utf-8"))
-            elif line == "dash force":
-                self.wfile.write(b"OK returning to dashboard (forced)\n.END\n")
-                self.wfile.flush()
-                break
-            elif line == "quit":
-                self.wfile.write(b"bye\n.END\n")
-                self.wfile.flush()
-                break
-            else:
-                self.wfile.write(f"ERR unknown {line}\n.END\n".encode("utf-8"))
+        try:
+            self.wfile.write(b"SHELFDBG/1 ready (type 'help')\n")
             self.wfile.flush()
+            while True:
+                raw = self.rfile.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                self.server.received.append(line)  # type: ignore[attr-defined]
+                if line == "ping":
+                    self.wfile.write(b"pong uptime_ms=123 stage=15_frame10_ok frame=12 mode=normal\n.END\n")
+                elif line.startswith("log"):
+                    self.wfile.write(b"[+10ms] [01_main_enter] ok\n[+20ms] [05_vd_info] surf=1280x720\n.END\n")
+                elif line == "gpu":
+                    self.wfile.write(b"reg[0x1841] (SCANOUT_CTRL) = 0x00000100\nreg[0x1844] (SCANOUT_ADDR) = 0x01000000\n.END\n")
+                elif line == "modes":
+                    self.wfile.write(b"modes_count=1 total_seen=1\n[0] 1280x720 @ 60.00Hz kind=3 flags=0x00000000 (progressive)\n.END\n")
+                elif line.startswith(("solid ", "cpu ")):
+                    self.wfile.write(f"OK {line}\n.END\n".encode("utf-8"))
+                elif line == "dash force":
+                    self.wfile.write(b"OK returning to dashboard (forced)\n.END\n")
+                    self.wfile.flush()
+                    break
+                elif line == "quit":
+                    self.server.quit_seen.set()  # type: ignore[attr-defined]
+                    self.wfile.write(b"bye\n.END\n")
+                    self.wfile.flush()
+                    break
+                else:
+                    self.wfile.write(f"ERR unknown {line}\n.END\n".encode("utf-8"))
+                self.wfile.flush()
+        except OSError:
+            pass
 
 
 class MockXbdmHandler(socketserver.StreamRequestHandler):
@@ -58,6 +62,7 @@ class MockServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, handler: type[socketserver.BaseRequestHandler]) -> None:
         self.received: list[str] = []
+        self.quit_seen = threading.Event()
         super().__init__(("127.0.0.1", 0), handler)
 
 
@@ -86,6 +91,7 @@ class XboxDebugTests(unittest.TestCase):
             self.assertEqual(len(client.command("gpu")), 2)
             self.assertEqual(len(client.command("modes")), 2)
 
+        self.assertTrue(self.srv.quit_seen.wait(timeout=2.0))
         self.assertIn("quit", self.srv.received)
 
     def test_cli_subcommands_solid_cpu_and_dash_force(self) -> None:
